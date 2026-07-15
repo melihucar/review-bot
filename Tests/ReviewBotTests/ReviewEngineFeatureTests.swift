@@ -1,0 +1,266 @@
+import Foundation
+import XCTest
+@testable import ReviewBot
+
+final class ReviewEngineFeatureTests: XCTestCase {
+    func testCleanReviewRunsInWorktreeUsesRepositoryRulesAndPostsApproval() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        let postedBody = await runner.lastPostedBody()
+        let claudePrompt = await runner.lastClaudePrompt()
+        let sawPreparedDiff = await runner.sawPreparedDiffDuringReview()
+        XCTAssertEqual(events.map(\.kind), [.requestDetected, .reviewStarted, .approved])
+        XCTAssertEqual(postCount, 1)
+        XCTAssertTrue(postedBody.contains("**Decision: Approved**"))
+        XCTAssertTrue(claudePrompt.contains("Mandatory repository review rules"))
+        XCTAssertTrue(claudePrompt.contains("Never approve an untested migration."))
+        XCTAssertTrue(sawPreparedDiff)
+    }
+
+    func testAlreadyReviewedRequestIsNotRunOrPostedAgain() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        for _ in 0..<2 {
+            await engine.poll(
+                configuration: fixture.configuration,
+                onEvent: { entry in await recorder.append(entry) },
+                onStatus: { _ in }
+            )
+        }
+
+        let postCount = await runner.postCount()
+        let claudeCount = await runner.claudeCount()
+        let events = await recorder.snapshot()
+        XCTAssertEqual(postCount, 1)
+        XCTAssertEqual(claudeCount, 1)
+        XCTAssertEqual(events.filter { $0.kind == .requestDetected }.count, 1)
+    }
+
+    func testFailedPostIsRecordedAndRetriedOnNextPoll() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failFirstPost: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        for _ in 0..<2 {
+            await engine.poll(
+                configuration: fixture.configuration,
+                onEvent: { entry in await recorder.append(entry) },
+                onStatus: { _ in }
+            )
+        }
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        XCTAssertEqual(postCount, 2)
+        XCTAssertTrue(events.contains(where: { $0.kind == .failed }))
+        XCTAssertTrue(events.contains(where: { $0.kind == .approved }))
+    }
+
+    func testCodexOnlyShouldFixVerdictRequestsChanges() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(codexVerdict: .shouldFix)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let claudeCount = await runner.claudeCount()
+        let codexCount = await runner.codexCount()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(claudeCount, 0)
+        XCTAssertEqual(codexCount, 1)
+        XCTAssertEqual(postArgument, "--request-changes")
+        XCTAssertEqual(events.last?.kind, .changesRequested)
+    }
+}
+
+private struct FeatureFixture {
+    let root: URL
+    let paths: StoragePaths
+    let configuration: ReviewBotConfiguration
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReviewBotFeatureTests-\(UUID().uuidString)", isDirectory: true)
+        paths = StoragePaths(root: root)
+        try paths.prepare()
+        configuration = ReviewBotConfiguration(
+            repositories: [
+                RepositoryConfiguration(
+                    name: "widget",
+                    path: "/mock/widget",
+                    githubSlug: "acme/widget"
+                ),
+            ],
+            pollIntervalMinutes: 15,
+            isPaused: false,
+            claude: ReviewerConfiguration(enabled: true, model: "claude-test", effort: .high),
+            codex: ReviewerConfiguration(enabled: false, model: "codex-test", effort: .high),
+            customPrompt: "Check public API compatibility."
+        )
+    }
+}
+
+private actor EventRecorder {
+    private var entries: [HistoryEntry] = []
+
+    func append(_ entry: HistoryEntry) { entries.append(entry) }
+    func snapshot() -> [HistoryEntry] { entries }
+}
+
+private actor ReviewWorkflowMock: CommandRunning {
+    private var posts = 0
+    private var claudeRuns = 0
+    private var codexRuns = 0
+    private var postedBody = ""
+    private var postArgument = ""
+    private var claudePrompt = ""
+    private var preparedDiffSeen = false
+    private let failFirstPost: Bool
+    private let codexVerdict: ReviewVerdict
+
+    init(failFirstPost: Bool = false, codexVerdict: ReviewVerdict = .clean) {
+        self.failFirstPost = failFirstPost
+        self.codexVerdict = codexVerdict
+    }
+
+    func run(
+        _ executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        timeout: Int
+    ) async throws -> CommandResult {
+        if executable == "gh", arguments.starts(with: ["api", "user"]) {
+            return result(stdout: "reviewer\n")
+        }
+        if executable == "gh", arguments.starts(with: ["search", "prs"]) {
+            return result(stdout: #"[{"number":42,"title":"Improve widgets","url":"https://github.com/acme/widget/pull/42"}]"#)
+        }
+        if executable == "gh", arguments.starts(with: ["pr", "view", "42"]),
+           arguments.contains("--json") {
+            return result(stdout: #"{"title":"Improve widgets","headRefOid":"1234567890abcdef","baseRefName":"main","baseRefOid":"abcdef1234567890","url":"https://github.com/acme/widget/pull/42"}"#)
+        }
+        if executable == "gh", arguments.contains("repos/acme/widget/issues/42/timeline") {
+            return result(stdout: "2026-07-15T10:00:00Z\n")
+        }
+        if executable == "git", arguments.contains("fetch") {
+            return result()
+        }
+        if executable == "git", arguments.contains("worktree"), arguments.contains("add") {
+            if let detachIndex = arguments.firstIndex(of: "--detach"),
+               arguments.indices.contains(detachIndex + 1) {
+                let directory = URL(fileURLWithPath: arguments[detachIndex + 1], isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            }
+            return result()
+        }
+        if executable == "git", arguments.contains("show") {
+            return result(stdout: "Never approve an untested migration.\n")
+        }
+        if executable == "gh", arguments.starts(with: ["pr", "diff", "42"]) {
+            return result(stdout: "diff --git a/a.swift b/a.swift\n")
+        }
+        if executable == "gh", arguments.starts(with: ["pr", "view", "42"]),
+           arguments.contains("--comments") {
+            return result(stdout: "PR conversation")
+        }
+        if executable == "gh", arguments.contains("repos/acme/widget/pulls/42/reviews") {
+            return result(stdout: "No prior reviews")
+        }
+        if executable == "gh", arguments.contains("repos/acme/widget/pulls/42/comments") {
+            return result(stdout: "No inline comments")
+        }
+        if executable == "claude" {
+            claudeRuns += 1
+            if let promptIndex = arguments.firstIndex(of: "-p"),
+               arguments.indices.contains(promptIndex + 1) {
+                claudePrompt = arguments[promptIndex + 1]
+            }
+            if let currentDirectory {
+                preparedDiffSeen = FileManager.default.fileExists(
+                    atPath: currentDirectory.appendingPathComponent(".review-bot-diff.patch").path
+                )
+            }
+            return result(stdout: "## Summary\nLooks safe.\n\nVERDICT: CLEAN\n")
+        }
+        if executable == "codex" {
+            codexRuns += 1
+            if let outputIndex = arguments.firstIndex(of: "-o"),
+               arguments.indices.contains(outputIndex + 1) {
+                let output = "## Summary\nCodex result.\n\nVERDICT: \(codexVerdict.rawValue)\n"
+                try Data(output.utf8).write(
+                    to: URL(fileURLWithPath: arguments[outputIndex + 1]),
+                    options: .atomic
+                )
+            }
+            return result()
+        }
+        if executable == "gh", arguments.starts(with: ["pr", "review", "42"]) {
+            posts += 1
+            postArgument = arguments.first(where: {
+                ["--approve", "--request-changes", "--comment"].contains($0)
+            }) ?? ""
+            if let bodyIndex = arguments.firstIndex(of: "--body-file"),
+               arguments.indices.contains(bodyIndex + 1) {
+                postedBody = (try? String(contentsOfFile: arguments[bodyIndex + 1], encoding: .utf8)) ?? ""
+            }
+            if failFirstPost, posts == 1 {
+                return result(exitCode: 1, stderr: "simulated post failure")
+            }
+            return result()
+        }
+        if executable == "git", arguments.contains("remove") {
+            return result()
+        }
+        if executable == "git", arguments.contains("prune") {
+            return result()
+        }
+
+        XCTFail("Unexpected command: \(executable) \(arguments.joined(separator: " "))")
+        return result(exitCode: 127, stderr: "unexpected command")
+    }
+
+    func postCount() -> Int { posts }
+    func claudeCount() -> Int { claudeRuns }
+    func codexCount() -> Int { codexRuns }
+    func lastPostedBody() -> String { postedBody }
+    func lastPostArgument() -> String { postArgument }
+    func lastClaudePrompt() -> String { claudePrompt }
+    func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
+
+    private func result(
+        exitCode: Int32 = 0,
+        stdout: String = "",
+        stderr: String = ""
+    ) -> CommandResult {
+        CommandResult(
+            command: "mock",
+            exitCode: exitCode,
+            stdout: stdout,
+            stderr: stderr
+        )
+    }
+}
