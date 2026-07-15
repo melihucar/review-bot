@@ -19,6 +19,13 @@ cp "$BIN_DIR/ReviewBot" "$MACOS_DIR/ReviewBot"
 cp "$ROOT/Packaging/Info.plist" "$CONTENTS_DIR/Info.plist"
 chmod +x "$MACOS_DIR/ReviewBot"
 
+# Stamp the release version (e.g. from a git tag) before signing so the
+# signature stays valid. Accepts "1.2.3" or "v1.2.3".
+if [ -n "${APP_VERSION:-}" ]; then
+	CLEAN_VERSION="${APP_VERSION#v}"
+	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CLEAN_VERSION" "$CONTENTS_DIR/Info.plist"
+fi
+
 codesign --force --deep --sign "$IDENTITY" "$APP_DIR"
 
 echo "Built: $APP_DIR"

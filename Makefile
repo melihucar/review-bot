@@ -1,7 +1,10 @@
-.PHONY: app build run test clean
+.PHONY: app build run test clean dmg
 
 app:
 	./scripts/build-app.sh
+
+dmg: app
+	./scripts/build-dmg.sh $(VERSION)
 
 build:
 	swift build

@@ -9,6 +9,7 @@ make build          # swift build (debug)
 make run            # swift run ReviewBot (dev; launch-at-login only works from the packaged app)
 make test           # swift test
 make app            # scripts/build-app.sh → dist/Review Bot.app (ad-hoc signed by default)
+make dmg VERSION=v1.2.3   # build the app, then package dist/ReviewBot-1.2.3.dmg (drag-to-install)
 make clean          # swift package clean
 
 swift test --filter VerdictTests              # run one test case/suite
@@ -16,6 +17,8 @@ swift test --filter ReviewEngineFeatureTests  # run the mocked end-to-end workfl
 ```
 
 Signed/notarizable build: `CODE_SIGN_IDENTITY="Developer ID Application: …" make app`.
+
+CI/release: `.github/workflows/ci.yml` runs build + test on every push/PR. `.github/workflows/release.yml` fires on a `v*` tag — it builds the DMG and publishes a GitHub Release. `APP_VERSION` (set to the tag) is stamped into `CFBundleShortVersionString` by `build-app.sh` **before** signing so the ad-hoc signature stays valid; the version is also the DMG filename.
 
 Note: `Package.swift` uses swift-tools 6.0 but pins **Swift 5 language mode**, so strict concurrency checks are relaxed even though the code uses actors/`@MainActor`.
 
