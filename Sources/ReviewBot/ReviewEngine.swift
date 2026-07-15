@@ -4,12 +4,14 @@ enum ReviewEngineError: LocalizedError {
     case commandFailed(String)
     case invalidResponse(String)
     case noReviewersEnabled
+    case reviewIncomplete(String)
 
     var errorDescription: String? {
         switch self {
         case let .commandFailed(message): message
         case let .invalidResponse(message): message
         case .noReviewersEnabled: "Enable Claude or Codex before running reviews."
+        case let .reviewIncomplete(message): message
         }
     }
 }
@@ -292,6 +294,25 @@ actor ReviewEngine {
                     baseCommitSHA: metadata.baseRefOid
                 )
             )
+
+            // Only post when every enabled reviewer finished with a parseable verdict.
+            // If any reviewer failed or returned no verdict, post nothing and leave the
+            // request unmarked so the next poll retries it.
+            let unfinished = results.filter { $0.failure != nil || $0.verdict == nil }
+            guard !results.isEmpty, unfinished.isEmpty else {
+                let detail = unfinished.isEmpty
+                    ? "no reviewer produced a result"
+                    : unfinished.map { result in
+                        if let failure = result.failure {
+                            return "\(result.reviewer.rawValue) failed (\(failure))"
+                        }
+                        return "\(result.reviewer.rawValue) returned no verdict"
+                    }.joined(separator: "; ")
+                throw ReviewEngineError.reviewIncomplete(
+                    "Review not posted, will retry next check — \(detail)"
+                )
+            }
+
             let decision = DecisionEvaluator.evaluate(results)
             let reviewBody = aggregateReview(
                 pullRequest: pullRequest,

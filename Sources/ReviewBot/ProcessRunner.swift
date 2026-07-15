@@ -119,7 +119,10 @@ struct ProcessRunner: CommandRunning {
 
         let stdout = String(decoding: (try? Data(contentsOf: stdoutURL)) ?? Data(), as: UTF8.self)
         let stderr = String(decoding: (try? Data(contentsOf: stderrURL)) ?? Data(), as: UTF8.self)
-        let displayCommand = ([executable] + arguments).joined(separator: " ")
+        // Only the executable name is surfaced in errors and results. The argument
+        // list can contain the full review prompt (plus any REVIEW.md and custom
+        // instructions), which must never leak into a posted review, history, or logs.
+        let displayCommand = executable
 
         if process.terminationReason == .uncaughtSignal, process.terminationStatus == SIGALRM {
             throw CommandExecutionError.timedOut(command: displayCommand, seconds: timeout)

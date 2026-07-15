@@ -98,9 +98,11 @@ Review Bot uses the strictest result:
 
 | Results | GitHub action |
 | --- | --- |
-| At least one `BLOCKING` or `SHOULD_FIX` | Request changes |
+| Every enabled reviewer returns a verdict; the strictest is `BLOCKING` or `SHOULD_FIX` | Request changes |
 | Every enabled reviewer returns `NITS_ONLY` or `CLEAN` | Approve |
-| A reviewer fails or returns no parseable verdict, with no stricter result | Neutral comment |
+| Any enabled reviewer fails or returns no parseable verdict | Nothing is posted; the request is retried on the next poll |
+
+Review Bot only posts when every enabled reviewer finishes with a parseable verdict. A failure (for example a reviewer timing out) posts nothing and leaves the request unmarked, so a later poll retries it rather than submitting a partial or broken review.
 
 Generated reviews clearly identify each reviewer and preserve their findings in collapsible sections.
 
@@ -113,8 +115,8 @@ Generated reviews clearly identify each reviewer and preserve their findings in 
 5. Save the unified diff and existing PR discussion inside the worktree.
 6. Load trusted `REVIEW.md` rules from the base commit.
 7. Run enabled reviewers with read-only tools and a 15-minute timeout.
-8. Aggregate verdicts and save the resulting Markdown.
-9. Submit the selected review through the authenticated GitHub CLI.
+8. If any enabled reviewer fails or returns no parseable verdict, post nothing and leave the request unmarked so a later poll retries it.
+9. Otherwise aggregate the verdicts, save the Markdown, and submit the strictest decision through the authenticated GitHub CLI.
 10. Mark the request completed only after GitHub accepts it, then remove the worktree.
 
 If submission fails, the request is not marked complete and will be retried during a later poll.

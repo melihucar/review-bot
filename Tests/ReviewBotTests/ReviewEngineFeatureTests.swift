@@ -71,6 +71,34 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(events.contains(where: { $0.kind == .approved }))
     }
 
+    func testReviewerFailureIsNotPostedAndRetriedOnNextPoll() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        for _ in 0..<2 {
+            await engine.poll(
+                configuration: configuration,
+                onEvent: { entry in await recorder.append(entry) },
+                onStatus: { _ in }
+            )
+        }
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        let codexCount = await runner.codexCount()
+        XCTAssertEqual(postCount, 0)
+        XCTAssertEqual(codexCount, 2)
+        XCTAssertTrue(events.contains(where: { $0.kind == .failed }))
+        XCTAssertFalse(events.contains(where: {
+            [.approved, .changesRequested, .commented].contains($0.kind)
+        }))
+    }
+
     func testCodexOnlyShouldFixVerdictRequestsChanges() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(codexVerdict: .shouldFix)
@@ -141,10 +169,12 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var preparedDiffSeen = false
     private let failFirstPost: Bool
     private let codexVerdict: ReviewVerdict
+    private let failCodex: Bool
 
-    init(failFirstPost: Bool = false, codexVerdict: ReviewVerdict = .clean) {
+    init(failFirstPost: Bool = false, codexVerdict: ReviewVerdict = .clean, failCodex: Bool = false) {
         self.failFirstPost = failFirstPost
         self.codexVerdict = codexVerdict
+        self.failCodex = failCodex
     }
 
     func run(
@@ -208,6 +238,9 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "codex" {
             codexRuns += 1
+            if failCodex {
+                return result(exitCode: 1, stderr: "simulated codex failure")
+            }
             if let outputIndex = arguments.firstIndex(of: "-o"),
                arguments.indices.contains(outputIndex + 1) {
                 let output = "## Summary\nCodex result.\n\nVERDICT: \(codexVerdict.rawValue)\n"
