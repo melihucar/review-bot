@@ -42,4 +42,20 @@ enum DecisionEvaluator {
 
         return .comment
     }
+
+    /// True when two or more reviewers parsed a verdict but land on opposite sides of the
+    /// gate threshold — at least one wants changes (`SHOULD_FIX`+) while at least one clears it.
+    /// A lone reviewer's false blocker is the main way strictest-wins mis-gates a correct PR, so
+    /// this disagreement is the signal to reconcile before deciding.
+    static func gateDisagreement(_ results: [ReviewerResult]) -> Bool {
+        let parsed = results.compactMap(\.verdict)
+        guard parsed.count >= 2 else { return false }
+        let gate = ReviewVerdict.shouldFix.rank
+        return parsed.contains { $0.rank >= gate } && parsed.contains { $0.rank < gate }
+    }
+
+    /// Maps a single reconciled verdict to the GitHub action.
+    static func decision(for verdict: ReviewVerdict) -> ReviewDecision {
+        verdict.rank >= ReviewVerdict.shouldFix.rank ? .requestChanges : .approve
+    }
 }

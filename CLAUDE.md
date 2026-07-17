@@ -40,9 +40,10 @@ A macOS menu-bar app (`MenuBarExtra`, `LSUIElement` accessory — no Dock icon) 
 4. Load trusted `REVIEW.md` via `git show <baseRefOid>:REVIEW.md` — **from the base commit, so a PR can't weaken its own review rules.**
 5. Run enabled reviewers **in parallel** (`async let`), each read-only (`claude --allowedTools Read Grep Glob`; `codex exec -s read-only`), 900s timeout.
 6. Each reviewer must emit a trailing `VERDICT: BLOCKING|SHOULD_FIX|NITS_ONLY|CLEAN` line (`VerdictParser`). `DecisionEvaluator` takes the **strictest** verdict: any `SHOULD_FIX`+ → request changes; all reviewers parsed and none strict → approve; any failure/unparseable verdict → neutral comment.
-7. Aggregate to Markdown, save under `reviews/`, submit with `gh pr review`. **Only after GitHub accepts** is the dedup key persisted and the worktree removed — so a failed post is retried on the next poll.
+7. **Reconciliation:** when two reviewers parsed verdicts that straddle the gate (`DecisionEvaluator.gateDisagreement` — one `SHOULD_FIX`+ while the other clears it), `runReconciliation` runs one more read-only pass (Claude if enabled, else Codex) with `DefaultPrompt.reconciliation`, feeding it both reviews to re-check each gating finding for substance and scope. Its verdict (via `DecisionEvaluator.decision(for:)`) becomes the decision; if the adjudicator fails or emits no verdict, fall back to the strictest. This keeps a single reviewer's false blocker from gating a correct PR. The reconciliation is disclosed in the posted Markdown.
+8. Aggregate to Markdown, save under `reviews/`, submit with `gh pr review`. **Only after GitHub accepts** is the dedup key persisted and the worktree removed — so a failed post is retried on the next poll.
 
-**Prompt composition:** `DefaultPrompt.combined(with: customPrompt, repositoryRules:)` layers the built-in review contract + global custom prompt + per-repo `REVIEW.md`.
+**Prompt composition:** `DefaultPrompt.combined(with: customPrompt, repositoryRules:)` layers the built-in review contract + global custom prompt + per-repo `REVIEW.md`. The contract enforces a **scope gate**: a finding may only be `BLOCKING`/`SHOULD_FIX` if its `path:line` is a line the diff adds/changes; pre-existing, out-of-diff, and third-party/vendored code are notes at most. `DefaultPrompt.reconciliation` reuses the same scope discipline when adjudicating.
 
 ## Notes for changes
 

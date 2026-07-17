@@ -313,12 +313,31 @@ actor ReviewEngine {
                 )
             }
 
-            let decision = DecisionEvaluator.evaluate(results)
+            let strictDecision = DecisionEvaluator.evaluate(results)
+            var decision = strictDecision
+            var adjudication: ReviewerResult?
+            if DecisionEvaluator.gateDisagreement(results) {
+                await onStatus("Reviewers disagreed on \(repository.name) #\(pullRequest.number); reconciling…")
+                let adjudicated = await runReconciliation(
+                    results: results,
+                    configuration: configuration,
+                    worktree: worktree
+                )
+                if let verdict = adjudicated.verdict {
+                    decision = DecisionEvaluator.decision(for: verdict)
+                    adjudication = adjudicated
+                } else {
+                    await logger.append(
+                        "Reconciliation for \(repository.githubSlug)#\(pullRequest.number) produced no verdict; using strictest (\(strictDecision.title))."
+                    )
+                }
+            }
             let reviewBody = aggregateReview(
                 pullRequest: pullRequest,
                 commitSHA: metadata.headRefOid,
                 results: results,
-                decision: decision
+                decision: decision,
+                adjudication: adjudication
             )
             let reviewFile = try saveReview(
                 reviewBody,
@@ -347,11 +366,14 @@ actor ReviewEngine {
             let verdicts = results.map {
                 "\($0.reviewer.rawValue): \($0.verdict?.rawValue ?? "unavailable")"
             }.joined(separator: ", ")
+            let reconciledNote = adjudication.map {
+                " Reconciled by \($0.reviewer.rawValue) → \($0.verdict?.rawValue ?? "unavailable")."
+            } ?? ""
             await emit(
                 kind: decision.historyKind,
                 repository: repository,
                 pullRequest: pullRequest,
-                message: "\(decision.title) — \(verdicts).",
+                message: "\(decision.title) — \(verdicts).\(reconciledNote)",
                 onEvent: onEvent
             )
         } catch {
@@ -553,6 +575,35 @@ actor ReviewEngine {
         return []
     }
 
+    private func runReconciliation(
+        results: [ReviewerResult],
+        configuration: ReviewBotConfiguration,
+        worktree: URL
+    ) async -> ReviewerResult {
+        let prompt = DefaultPrompt.reconciliation(
+            reviews: results.map {
+                (
+                    reviewer: $0.reviewer.rawValue,
+                    body: VerdictParser.bodyWithoutTrailer($0.output),
+                    verdict: $0.verdict?.rawValue ?? "unavailable"
+                )
+            }
+        )
+        // Both reviewers are enabled whenever verdicts disagree; prefer Claude as adjudicator.
+        if configuration.claude.enabled {
+            return await runClaude(
+                configuration: configuration.claude,
+                prompt: prompt,
+                worktree: worktree
+            )
+        }
+        return await runCodex(
+            configuration: configuration.codex,
+            prompt: prompt,
+            worktree: worktree
+        )
+    }
+
     private func loadRepositoryReviewRules(
         repository: RepositoryConfiguration,
         baseCommitSHA: String
@@ -659,7 +710,8 @@ actor ReviewEngine {
         pullRequest: PullRequestSummary,
         commitSHA: String,
         results: [ReviewerResult],
-        decision: ReviewDecision
+        decision: ReviewDecision,
+        adjudication: ReviewerResult?
     ) -> String {
         let verdictSummary = results.map {
             "\($0.reviewer.rawValue): `\($0.verdict?.rawValue ?? "unavailable")`"
@@ -683,10 +735,26 @@ actor ReviewEngine {
             note = "At least one reviewer failed or returned an unreadable verdict, so this review is neutral."
         }
 
+        var reconciliationSection = ""
+        if let adjudication {
+            let reconciledVerdict = adjudication.verdict?.rawValue ?? "unavailable"
+            reconciliationSection = """
+
+
+            > **The reviewers disagreed, so \(adjudication.reviewer.rawValue) reconciled the findings** and set the final verdict to `\(reconciledVerdict)` after re-checking each gating finding for substance and scope.
+
+            <details><summary><strong>Reconciliation — \(adjudication.reviewer.rawValue) (\(adjudication.model))</strong></summary>
+
+            \(VerdictParser.bodyWithoutTrailer(adjudication.output))
+
+            </details>
+            """
+        }
+
         return """
         ## Automated review — PR #\(pullRequest.number)
 
-        **Decision: \(decision.title)** — \(note)
+        **Decision: \(decision.title)** — \(note)\(reconciliationSection)
 
         Independent reviews of `\(commitSHA.prefix(8))` (\(verdictSummary)). These findings are advisory; verify them before acting.
 

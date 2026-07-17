@@ -99,6 +99,83 @@ final class ReviewEngineFeatureTests: XCTestCase {
         }))
     }
 
+    func testDisagreementReconcilesAndOverturnsLoneShouldFix() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .shouldFix,
+            reconciledVerdict: .clean
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let reconciliationCount = await runner.reconciliationCount()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(reconciliationCount, 1)
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertEqual(events.last?.kind, .approved)
+        XCTAssertTrue(postedBody.contains("reconciled the findings"))
+    }
+
+    func testDisagreementReconcilesAndUpholdsShouldFix() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .shouldFix,
+            reconciledVerdict: .shouldFix
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let reconciliationCount = await runner.reconciliationCount()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(reconciliationCount, 1)
+        XCTAssertEqual(postArgument, "--request-changes")
+        XCTAssertEqual(events.last?.kind, .changesRequested)
+    }
+
+    func testAgreingReviewersDoNotTriggerReconciliation() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeVerdict: .clean, codexVerdict: .clean)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let reconciliationCount = await runner.reconciliationCount()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(reconciliationCount, 0)
+        XCTAssertEqual(postArgument, "--approve")
+    }
+
     func testCodexOnlyShouldFixVerdictRequestsChanges() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(codexVerdict: .shouldFix)
@@ -163,17 +240,28 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var posts = 0
     private var claudeRuns = 0
     private var codexRuns = 0
+    private var reconciliationRuns = 0
     private var postedBody = ""
     private var postArgument = ""
     private var claudePrompt = ""
     private var preparedDiffSeen = false
     private let failFirstPost: Bool
+    private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
+    private let reconciledVerdict: ReviewVerdict?
     private let failCodex: Bool
 
-    init(failFirstPost: Bool = false, codexVerdict: ReviewVerdict = .clean, failCodex: Bool = false) {
+    init(
+        failFirstPost: Bool = false,
+        claudeVerdict: ReviewVerdict = .clean,
+        codexVerdict: ReviewVerdict = .clean,
+        reconciledVerdict: ReviewVerdict? = nil,
+        failCodex: Bool = false
+    ) {
         self.failFirstPost = failFirstPost
+        self.claudeVerdict = claudeVerdict
         self.codexVerdict = codexVerdict
+        self.reconciledVerdict = reconciledVerdict
         self.failCodex = failCodex
     }
 
@@ -224,17 +312,22 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: "No inline comments")
         }
         if executable == "claude" {
-            claudeRuns += 1
-            if let promptIndex = arguments.firstIndex(of: "-p"),
-               arguments.indices.contains(promptIndex + 1) {
-                claudePrompt = arguments[promptIndex + 1]
+            let prompt = arguments.firstIndex(of: "-p").flatMap { index in
+                arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
+            } ?? ""
+            if prompt.contains("reconciling two independent automated reviews") {
+                reconciliationRuns += 1
+                let verdict = reconciledVerdict ?? .clean
+                return result(stdout: "## Reconciliation\nRe-checked findings.\n\nVERDICT: \(verdict.rawValue)\n")
             }
+            claudeRuns += 1
+            claudePrompt = prompt
             if let currentDirectory {
                 preparedDiffSeen = FileManager.default.fileExists(
                     atPath: currentDirectory.appendingPathComponent(".review-bot-diff.patch").path
                 )
             }
-            return result(stdout: "## Summary\nLooks safe.\n\nVERDICT: CLEAN\n")
+            return result(stdout: "## Summary\nLooks safe.\n\nVERDICT: \(claudeVerdict.rawValue)\n")
         }
         if executable == "codex" {
             codexRuns += 1
@@ -279,6 +372,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func postCount() -> Int { posts }
     func claudeCount() -> Int { claudeRuns }
     func codexCount() -> Int { codexRuns }
+    func reconciliationCount() -> Int { reconciliationRuns }
     func lastPostedBody() -> String { postedBody }
     func lastPostArgument() -> String { postArgument }
     func lastClaudePrompt() -> String { claudePrompt }

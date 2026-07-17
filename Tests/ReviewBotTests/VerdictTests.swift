@@ -46,6 +46,42 @@ final class VerdictTests: XCTestCase {
         XCTAssertEqual(DecisionEvaluator.evaluate(results), .comment)
     }
 
+    func testGateDisagreementWhenReviewersStraddleTheGate() {
+        XCTAssertTrue(DecisionEvaluator.gateDisagreement([
+            result(.claude, verdict: .clean),
+            result(.codex, verdict: .shouldFix),
+        ]))
+        XCTAssertTrue(DecisionEvaluator.gateDisagreement([
+            result(.claude, verdict: .nitsOnly),
+            result(.codex, verdict: .blocking),
+        ]))
+    }
+
+    func testNoGateDisagreementWhenReviewersAgreeOrAreAlone() {
+        XCTAssertFalse(DecisionEvaluator.gateDisagreement([
+            result(.claude, verdict: .shouldFix),
+            result(.codex, verdict: .blocking),
+        ]))
+        XCTAssertFalse(DecisionEvaluator.gateDisagreement([
+            result(.claude, verdict: .clean),
+            result(.codex, verdict: .nitsOnly),
+        ]))
+        XCTAssertFalse(DecisionEvaluator.gateDisagreement([
+            result(.codex, verdict: .shouldFix),
+        ]))
+        XCTAssertFalse(DecisionEvaluator.gateDisagreement([
+            result(.claude, verdict: .blocking),
+            result(.codex, verdict: nil),
+        ]))
+    }
+
+    func testDecisionForReconciledVerdict() {
+        XCTAssertEqual(DecisionEvaluator.decision(for: .blocking), .requestChanges)
+        XCTAssertEqual(DecisionEvaluator.decision(for: .shouldFix), .requestChanges)
+        XCTAssertEqual(DecisionEvaluator.decision(for: .nitsOnly), .approve)
+        XCTAssertEqual(DecisionEvaluator.decision(for: .clean), .approve)
+    }
+
     private func result(
         _ reviewer: ReviewerName,
         verdict: ReviewVerdict?

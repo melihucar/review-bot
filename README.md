@@ -104,6 +104,10 @@ Review Bot uses the strictest result:
 
 Review Bot only posts when every enabled reviewer finishes with a parseable verdict. A failure (for example a reviewer timing out) posts nothing and leaves the request unmarked, so a later poll retries it rather than submitting a partial or broken review.
 
+When two reviewers disagree across the gate — one wants changes while the other approves — Review Bot runs one more read-only reconciliation pass that re-checks each blocking finding against the actual diff and its scope, then uses that adjudicated verdict instead of blindly taking the strictest. This keeps one reviewer's mistaken blocker from stopping a correct pull request. The reconciliation and its verdict are shown in the posted review.
+
+Every finding is also held to a scope gate: a defect may only block or request changes when it lives on a line the pull request adds or changes. Pre-existing issues, code outside the diff, and behavior owned by third-party dependencies are surfaced as notes, never as merge blockers.
+
 Generated reviews clearly identify each reviewer and preserve their findings in collapsible sections.
 
 ## Runtime flow
@@ -116,8 +120,9 @@ Generated reviews clearly identify each reviewer and preserve their findings in 
 6. Load trusted `REVIEW.md` rules from the base commit.
 7. Run enabled reviewers with read-only tools and a 15-minute timeout.
 8. If any enabled reviewer fails or returns no parseable verdict, post nothing and leave the request unmarked so a later poll retries it.
-9. Otherwise aggregate the verdicts, save the Markdown, and submit the strictest decision through the authenticated GitHub CLI.
-10. Mark the request completed only after GitHub accepts it, then remove the worktree.
+9. If the reviewers disagree across the gate, run one read-only reconciliation pass and use its adjudicated verdict.
+10. Otherwise aggregate the verdicts, save the Markdown, and submit the resulting decision through the authenticated GitHub CLI.
+11. Mark the request completed only after GitHub accepts it, then remove the worktree.
 
 If submission fails, the request is not marked complete and will be retried during a later poll.
 
@@ -158,4 +163,4 @@ Use **History → Show data folder** to open this location.
 make test
 ```
 
-The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, and repository inspection. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
+The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, and repository inspection. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
