@@ -18,7 +18,7 @@ swift test --filter ReviewEngineFeatureTests  # run the mocked end-to-end workfl
 
 Signed/notarizable build: `CODE_SIGN_IDENTITY="Developer ID Application: …" make app`.
 
-CI/release: `.github/workflows/ci.yml` runs build + test on every push/PR. `.github/workflows/release.yml` fires on a `v*` tag — it builds the DMG and publishes a GitHub Release. `APP_VERSION` (set to the tag) is stamped into `CFBundleShortVersionString` by `build-app.sh` **before** signing so the ad-hoc signature stays valid; the version is also the DMG filename.
+CI/release: `.github/workflows/ci.yml` runs build + test on every push/PR. `.github/workflows/release.yml` fires on a `v*` tag — it builds the DMG and publishes a GitHub Release. `APP_VERSION` (set to the tag) is stamped into `CFBundleShortVersionString` by `build-app.sh` **before** signing so the ad-hoc signature stays valid; the version is also the DMG filename. The Release body is extracted from the matching `## [<version>]` section of `CHANGELOG.md`; the workflow **fails** if that section is missing, so the changelog must be updated before tagging.
 
 Note: `Package.swift` uses swift-tools 6.0 but pins **Swift 5 language mode**, so strict concurrency checks are relaxed even though the code uses actors/`@MainActor`.
 
@@ -47,6 +47,7 @@ A macOS menu-bar app (`MenuBarExtra`, `LSUIElement` accessory — no Dock icon) 
 
 ## Notes for changes
 
+- **Always update `CHANGELOG.md` in the same change.** Whenever you implement, change, fix, or remove anything, add a bullet under `## [Unreleased]` in the correct group (`Added` / `Changed` / `Fixed` / `Removed`), following [Keep a Changelog](https://keepachangelog.com/). Releases derive their GitHub Release notes from the matching version section, and `release.yml` fails the release if a tag has no `## [<version>]` entry. To cut a release: rename `## [Unreleased]` to `## [<version>] - <YYYY-MM-DD>`, add a fresh empty `## [Unreleased]`, update the compare links at the bottom, then tag `v<version>`.
 - Adding a reviewer CLI: extend `ReviewerName`, add a `run…` method in `ReviewEngine`, wire it into `runReviewers`, and surface config in `ReviewersSettingsView`. Keep the read-only sandbox flags.
 - The settings window is created manually as an `NSWindow` (not SwiftUI `Settings` scene). Because the app is an accessory, `openSettings()` must promote the app to `.setActivationPolicy(.regular)` to bring the window forward, and revert to `.accessory` on close.
 - Config decoding is defensive (`decodeIfPresent` with defaults) to survive schema migrations — preserve that when adding fields.

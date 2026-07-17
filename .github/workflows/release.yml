@@ -15,6 +15,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Extract release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { capture=1; next }
+            capture && /^## \[/ { exit }
+            capture {
+              if (!started && $0 ~ /^[[:space:]]*$/) next
+              started=1
+              print
+            }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::No CHANGELOG.md section found for version $version. Add a '## [$version]' entry before tagging."
+            exit 1
+          fi
+          echo "----- release notes for $version -----"
+          cat release-notes.md
+
       - name: Run tests
         run: swift test
 
@@ -30,5 +49,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/ReviewBot-*.dmg
-          generate_release_notes: true
+          body_path: release-notes.md
           fail_on_unmatched_files: true
