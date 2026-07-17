@@ -164,3 +164,14 @@ make test
 ```
 
 The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, and repository inspection. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
+
+## Roadmap
+
+Planned improvements, not yet implemented, roughly in priority order:
+
+- **Verification pass on every gating review.** A second read-only pass currently reconciles the verdict only when the two reviewers disagree. Extend it to run whenever a review would request changes — including single-reviewer setups — so one reviewer's mistaken blocker is caught before it is posted.
+- **Path-scoped `REVIEW.md` rules.** Let rules attach to file globs (for example `Sources/Billing/**`) so a rule applies only when the pull request changes a matching file, instead of every rule applying to every review. Flat `REVIEW.md` files keep working as global rules.
+- **Incremental review of new commits.** When a pull request receives a new commit, review only what changed since the previous review rather than re-reviewing the whole diff, to avoid repeating findings on unchanged code.
+- **Deterministic linters as grounding.** Optionally run the repository's own read-only linters on the changed files and provide their output to the reviewers as evidence, without building the project.
+- **Per-repository learnings.** When an author explains that a finding was wrong, remember that locally and apply it to later reviews of the same repository.
+- **Severity labels on findings.** Tag each finding by severity in the posted review so it is easy to triage at a glance.
