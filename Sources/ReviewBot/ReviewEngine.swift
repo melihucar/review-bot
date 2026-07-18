@@ -313,10 +313,11 @@ actor ReviewEngine {
                 )
             }
 
-            let strictDecision = DecisionEvaluator.evaluate(results)
+            let policy = configuration.decisionPolicy
+            let strictDecision = DecisionEvaluator.evaluate(results, policy: policy)
             var decision = strictDecision
             var adjudication: ReviewerResult?
-            if DecisionEvaluator.gateDisagreement(results) {
+            if DecisionEvaluator.gateDisagreement(results, policy: policy) {
                 await onStatus("Reviewers disagreed on \(repository.name) #\(pullRequest.number); reconciling…")
                 let adjudicated = await runReconciliation(
                     results: results,
@@ -324,7 +325,7 @@ actor ReviewEngine {
                     worktree: worktree
                 )
                 if let verdict = adjudicated.verdict {
-                    decision = DecisionEvaluator.decision(for: verdict)
+                    decision = DecisionEvaluator.decision(for: verdict, policy: policy)
                     adjudication = adjudicated
                 } else {
                     await logger.append(
@@ -728,11 +729,11 @@ actor ReviewEngine {
         let note: String
         switch decision {
         case .approve:
-            note = "All enabled reviewers found only optional nits or no issues."
+            note = "No reviewer found an issue the current decision policy blocks on."
         case .requestChanges:
-            note = "At least one enabled reviewer found a blocking or should-fix issue."
+            note = "At least one reviewer found an issue the current decision policy treats as blocking."
         case .comment:
-            note = "At least one reviewer failed or returned an unreadable verdict, so this review is neutral."
+            note = "This review is neutral under the current decision policy (a reviewer failed, returned an unreadable verdict, or the policy leaves this severity to you)."
         }
 
         var reconciliationSection = ""

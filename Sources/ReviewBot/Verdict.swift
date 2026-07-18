@@ -28,34 +28,38 @@ enum VerdictParser {
 }
 
 enum DecisionEvaluator {
-    static func evaluate(_ results: [ReviewerResult]) -> ReviewDecision {
+    static func evaluate(_ results: [ReviewerResult], policy: DecisionPolicy) -> ReviewDecision {
         let parsed = results.compactMap(\.verdict)
-        let worstRank = parsed.map(\.rank).max() ?? -1
+        let actions = parsed.map { policy.action(for: $0) }
+        let worstAction = actions.max(by: { $0.rank < $1.rank })
 
-        if worstRank >= ReviewVerdict.shouldFix.rank {
+        // A verdict the policy treats as blocking wins, even if another reviewer failed to parse.
+        if worstAction == .requestChanges {
             return .requestChanges
         }
 
+        // Every reviewer produced a readable verdict: honour the strictest configured action
+        // (`.comment` if any level is set to "leave it to me", otherwise `.approve`).
         if !results.isEmpty, parsed.count == results.count {
-            return .approve
+            return worstAction ?? .approve
         }
 
+        // A reviewer failed or emitted no verdict: stay neutral.
         return .comment
     }
 
     /// True when two or more reviewers parsed a verdict but land on opposite sides of the
-    /// gate threshold — at least one wants changes (`SHOULD_FIX`+) while at least one clears it.
-    /// A lone reviewer's false blocker is the main way strictest-wins mis-gates a correct PR, so
-    /// this disagreement is the signal to reconcile before deciding.
-    static func gateDisagreement(_ results: [ReviewerResult]) -> Bool {
-        let parsed = results.compactMap(\.verdict)
-        guard parsed.count >= 2 else { return false }
-        let gate = ReviewVerdict.shouldFix.rank
-        return parsed.contains { $0.rank >= gate } && parsed.contains { $0.rank < gate }
+    /// policy's request-changes boundary — at least one action is `.requestChanges` while at
+    /// least one is not. A lone reviewer's false blocker is the main way strictest-wins
+    /// mis-gates a correct PR, so this disagreement is the signal to reconcile before deciding.
+    static func gateDisagreement(_ results: [ReviewerResult], policy: DecisionPolicy) -> Bool {
+        let actions = results.compactMap(\.verdict).map { policy.action(for: $0) }
+        guard actions.count >= 2 else { return false }
+        return actions.contains { $0 == .requestChanges } && actions.contains { $0 != .requestChanges }
     }
 
-    /// Maps a single reconciled verdict to the GitHub action.
-    static func decision(for verdict: ReviewVerdict) -> ReviewDecision {
-        verdict.rank >= ReviewVerdict.shouldFix.rank ? .requestChanges : .approve
+    /// Maps a single reconciled verdict to the GitHub action under the active policy.
+    static func decision(for verdict: ReviewVerdict, policy: DecisionPolicy) -> ReviewDecision {
+        policy.action(for: verdict)
     }
 }

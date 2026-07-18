@@ -43,6 +43,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var claude: ReviewerConfiguration
     var codex: ReviewerConfiguration
     var customPrompt: String
+    var decisionPolicy: DecisionPolicy
 
     static let `default` = ReviewBotConfiguration(
         repositories: [],
@@ -58,7 +59,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
             model: "gpt-5.6-sol",
             effort: .high
         ),
-        customPrompt: ""
+        customPrompt: "",
+        decisionPolicy: .default
     )
 
     private enum CodingKeys: String, CodingKey {
@@ -68,6 +70,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case claude
         case codex
         case customPrompt
+        case decisionPolicy
     }
 
     init(
@@ -76,7 +79,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         isPaused: Bool,
         claude: ReviewerConfiguration,
         codex: ReviewerConfiguration,
-        customPrompt: String
+        customPrompt: String,
+        decisionPolicy: DecisionPolicy = .default
     ) {
         self.repositories = repositories
         self.pollIntervalMinutes = pollIntervalMinutes
@@ -84,6 +88,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.claude = claude
         self.codex = codex
         self.customPrompt = customPrompt
+        self.decisionPolicy = decisionPolicy
     }
 
     init(from decoder: Decoder) throws {
@@ -112,6 +117,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
             codex.effort = .high
         }
         customPrompt = try values.decodeIfPresent(String.self, forKey: .customPrompt) ?? ""
+        decisionPolicy = try values.decodeIfPresent(
+            DecisionPolicy.self,
+            forKey: .decisionPolicy
+        ) ?? .default
     }
 }
 
@@ -209,16 +218,37 @@ struct ReviewerResult: Equatable {
     var failure: String?
 }
 
-enum ReviewDecision: Equatable {
-    case approve
-    case requestChanges
-    case comment
+enum ReviewDecision: String, Codable, CaseIterable, Identifiable {
+    case approve = "approve"
+    case requestChanges = "request_changes"
+    case comment = "comment"
+
+    var id: String { rawValue }
+
+    /// Severity ordering used to combine per-verdict actions across reviewers:
+    /// requestChanges (strictest) > comment > approve.
+    var rank: Int {
+        switch self {
+        case .requestChanges: 2
+        case .comment: 1
+        case .approve: 0
+        }
+    }
 
     var title: String {
         switch self {
         case .approve: "Approved"
         case .requestChanges: "Changes requested"
         case .comment: "Commented"
+        }
+    }
+
+    /// User-facing label for the decision-policy pickers.
+    var actionLabel: String {
+        switch self {
+        case .approve: "Approve"
+        case .requestChanges: "Request changes"
+        case .comment: "Leave it to me"
         }
     }
 
@@ -235,6 +265,29 @@ enum ReviewDecision: Equatable {
         case .approve: .approved
         case .requestChanges: .changesRequested
         case .comment: .commented
+        }
+    }
+}
+
+/// Maps each configurable reviewer verdict to the GitHub action the bot takes.
+/// `BLOCKING` is always `.requestChanges` and is not user-configurable.
+struct DecisionPolicy: Codable, Equatable {
+    var shouldFix: ReviewDecision
+    var nitsOnly: ReviewDecision
+    var clean: ReviewDecision
+
+    static let `default` = DecisionPolicy(
+        shouldFix: .requestChanges,
+        nitsOnly: .approve,
+        clean: .approve
+    )
+
+    func action(for verdict: ReviewVerdict) -> ReviewDecision {
+        switch verdict {
+        case .blocking: .requestChanges
+        case .shouldFix: shouldFix
+        case .nitsOnly: nitsOnly
+        case .clean: clean
         }
     }
 }

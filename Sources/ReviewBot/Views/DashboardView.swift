@@ -12,6 +12,9 @@ struct DashboardView: View {
             ReviewersSettingsView(model: model, settings: model.settings)
                 .tabItem { Label("Reviewers", systemImage: "sparkles") }
 
+            DecisionPolicySettingsView(settings: model.settings)
+                .tabItem { Label("Decisions", systemImage: "checklist") }
+
             PromptSettingsView(settings: model.settings)
                 .tabItem { Label("Prompt", systemImage: "text.quote") }
 
@@ -340,6 +343,96 @@ private struct ToolAvailabilityBadge: View {
         )
         .font(.caption)
         .foregroundStyle(isAvailable ? .green : .orange)
+    }
+}
+
+private struct DecisionPolicySettingsView: View {
+    @ObservedObject var settings: SettingsStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Decision policy")
+                    .font(.title2.weight(.semibold))
+                Text("Choose what Review Bot does on GitHub for each severity its reviewers report. When reviewers disagree across the request-changes line, Review Bot reconciles before deciding.")
+                    .foregroundStyle(.secondary)
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 14) {
+                    DecisionRow(
+                        verdict: "Blocking",
+                        detail: "Always requests changes.",
+                        selection: .constant(.requestChanges)
+                    )
+                    .disabled(true)
+
+                    Divider()
+
+                    DecisionRow(
+                        verdict: "Should-fix",
+                        detail: "Substantive issues that are not release-blocking.",
+                        selection: $settings.configuration.decisionPolicy.shouldFix
+                    )
+                    DecisionRow(
+                        verdict: "Nits only",
+                        detail: "Minor, optional suggestions.",
+                        selection: $settings.configuration.decisionPolicy.nitsOnly
+                    )
+                    DecisionRow(
+                        verdict: "Clean",
+                        detail: "No issues found.",
+                        selection: $settings.configuration.decisionPolicy.clean
+                    )
+                }
+                .padding(8)
+            } label: {
+                Label("When the strictest verdict is…", systemImage: "arrow.triangle.branch")
+            }
+
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "info.circle")
+                    .foregroundStyle(.secondary)
+                Text("“Leave it to me” posts a neutral comment — no approval and no change request — so you make the call. A reviewer that fails or returns an unreadable verdict always falls back to a neutral comment.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Reset to defaults") {
+                    settings.configuration.decisionPolicy = .default
+                }
+                .disabled(settings.configuration.decisionPolicy == .default)
+            }
+
+            Spacer()
+        }
+        .padding(.top, 10)
+    }
+}
+
+private struct DecisionRow: View {
+    let verdict: String
+    let detail: String
+    @Binding var selection: ReviewDecision
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verdict)
+                    .font(.headline)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: 190, alignment: .leading)
+
+            Picker("Action", selection: $selection) {
+                ForEach(ReviewDecision.allCases) { decision in
+                    Text(decision.actionLabel).tag(decision)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+        }
     }
 }
 

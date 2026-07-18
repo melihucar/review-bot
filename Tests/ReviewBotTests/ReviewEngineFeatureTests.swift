@@ -200,6 +200,58 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(postArgument, "--request-changes")
         XCTAssertEqual(events.last?.kind, .changesRequested)
     }
+
+    func testPolicyBlockingOnNitsRequestsChanges() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(codexVerdict: .nitsOnly)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = true
+        configuration.decisionPolicy = DecisionPolicy(
+            shouldFix: .requestChanges,
+            nitsOnly: .requestChanges,
+            clean: .approve
+        )
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(postArgument, "--request-changes")
+        XCTAssertEqual(events.last?.kind, .changesRequested)
+    }
+
+    func testPolicyApprovingShouldFixApproves() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(codexVerdict: .shouldFix)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = true
+        configuration.decisionPolicy = DecisionPolicy(
+            shouldFix: .approve,
+            nitsOnly: .approve,
+            clean: .approve
+        )
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertEqual(events.last?.kind, .approved)
+    }
 }
 
 private struct FeatureFixture {

@@ -11,8 +11,11 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-18
+
 ### Added
 
+- A configurable **decision policy** (new "Decisions" settings tab). For each reviewer severity — Should-fix, Nits only, Clean — you choose whether Review Bot **Approves**, **Leaves it to you** (posts a neutral comment), or **Requests changes**. `BLOCKING` always requests changes and is locked. Defaults match prior behavior, so existing configs are unchanged, and reviewer-disagreement reconciliation now follows the configured request-changes boundary.
 - A roadmap section in the README outlining planned improvements.
 - This `CHANGELOG.md`; each tagged release now sources its GitHub Release notes from the matching version section here.
 
@@ -49,7 +52,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/melihucar/review-bot/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/melihucar/review-bot/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/melihucar/review-bot/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/melihucar/review-bot/compare/v0.1.0...v0.1.1
