@@ -47,6 +47,96 @@ enum CommandExecutionError: LocalizedError {
 struct ProcessRunner: CommandRunning {
     private let fileManager = FileManager.default
 
+    /// The `PATH` every spawned command inherits. A Finder- or launch-at-login-started app
+    /// inherits launchd's minimal environment (often just `/usr/bin:/bin:/usr/sbin:/sbin`),
+    /// so CLIs installed by a version manager (nvm, mise, volta, fnm, asdf) are unreachable.
+    /// We ask the login+interactive shell for its real `PATH` once, then fall back to a fixed
+    /// list of common install dirs and the inherited value. Computed lazily, exactly once.
+    static let augmentedPath: String = composePATH(
+        shellPath: loginShellPATH(),
+        inherited: ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+        home: FileManager.default.homeDirectoryForCurrentUser.path
+    )
+
+    /// Merges the login-shell `PATH` (if any), a fixed list of common install directories, and
+    /// the inherited `PATH` into a single ordered, de-duplicated `PATH`. Pure so it can be tested
+    /// without spawning a shell.
+    static func composePATH(shellPath: String?, inherited: String, home: String) -> String {
+        let preferredPaths = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "\(home)/.local/bin",
+            "\(home)/.npm-global/bin",
+        ]
+        let ordered = (shellPath.map { [$0] } ?? []) + preferredPaths + [inherited]
+        var seen = Set<String>()
+        let entries = ordered
+            .flatMap { $0.split(separator: ":", omittingEmptySubsequences: true).map(String.init) }
+            .filter { seen.insert($0).inserted }
+        return entries.joined(separator: ":")
+    }
+
+    /// Asks the user's login+interactive shell for its `PATH`, or `nil` if the probe fails.
+    /// Uses `-i -l` so rc files that initialise version managers (commonly `~/.zshrc`) are sourced,
+    /// wraps the shell in the same `perl alarm` timeout used for reviews so a hanging rc file can't
+    /// stall startup, and emits the value behind a sentinel so a chatty rc banner can't corrupt it.
+    private static func loginShellPATH() -> String? {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let sentinel = "__REVIEWBOT_PATH__:"
+        let script = "printf '%s%s\\n' '\(sentinel)' \"$PATH\""
+        guard let output = captureStdout(
+            "/usr/bin/perl",
+            arguments: [
+                "-e", "alarm shift @ARGV; exec @ARGV or exit 127",
+                "5",
+                shell, "-ilc", script,
+            ]
+        ) else {
+            return nil
+        }
+
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true)
+        where line.hasPrefix(sentinel) {
+            let value = line.dropFirst(sentinel.count).trimmingCharacters(in: .whitespaces)
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
+    /// Runs a process to completion and returns its stdout, or `nil` on any failure. Reads stdout
+    /// from a temp file (not a pipe) so a large rc banner can't deadlock, and discards stderr.
+    private static func captureStdout(_ launchPath: String, arguments: [String]) -> String? {
+        let fm = FileManager.default
+        let directory = fm.temporaryDirectory
+            .appendingPathComponent("review-bot-path-\(UUID().uuidString)", isDirectory: true)
+        guard (try? fm.createDirectory(at: directory, withIntermediateDirectories: true)) != nil else {
+            return nil
+        }
+        defer { try? fm.removeItem(at: directory) }
+
+        let stdoutURL = directory.appendingPathComponent("stdout")
+        fm.createFile(atPath: stdoutURL.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: stdoutURL) else { return nil }
+        defer { try? handle.close() }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+        process.standardOutput = handle
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        process.waitUntilExit()
+        try? handle.synchronize()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(decoding: (try? Data(contentsOf: stdoutURL)) ?? Data(), as: UTF8.self)
+    }
+
     func run(
         _ executable: String,
         arguments: [String] = [],
@@ -101,15 +191,7 @@ struct ProcessRunner: CommandRunning {
         process.standardInput = FileHandle.nullDevice
 
         var environment = ProcessInfo.processInfo.environment
-        let existingPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let preferredPaths = [
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "\(home)/.local/bin",
-            "\(home)/.npm-global/bin",
-        ]
-        environment["PATH"] = (preferredPaths + [existingPath]).joined(separator: ":")
+        environment["PATH"] = Self.augmentedPath
         process.environment = environment
 
         try process.run()

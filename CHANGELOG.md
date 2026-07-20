@@ -11,6 +11,12 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-20
+
+### Fixed
+
+- CLIs installed through a version manager (nvm, mise, volta, fnm, asdf) are now found when the app is launched from Finder or at login. Such an app inherits launchd's minimal `PATH`, which excluded those install dirs, so `claude`/`codex` showed as "not found" and no reviews could run ([#1](https://github.com/melihucar/review-bot/issues/1)). `ProcessRunner` now probes the login+interactive shell for its real `PATH` once at startup (behind a sentinel marker and a `perl alarm` timeout so a chatty or hanging rc file can't corrupt or stall it), prepends it, and keeps the previous fixed directory list as a fallback.
+
 ## [0.1.6] - 2026-07-20
 
 ### Added
@@ -64,7 +70,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/melihucar/review-bot/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/melihucar/review-bot/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/melihucar/review-bot/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/melihucar/review-bot/compare/v0.1.3...v0.1.4

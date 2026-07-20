@@ -67,7 +67,7 @@ Launch-at-login registration only works reliably from the packaged app in `/Appl
 6. Optionally add global custom review instructions.
 7. Select **Run now** to verify the setup.
 
-CLI availability is shown on the Reviewers tab. Review Bot searches common Homebrew, local-user, and npm binary directories in addition to the process `PATH`.
+CLI availability is shown on the Reviewers tab. Review Bot asks your login shell for its `PATH` at startup — so CLIs installed through a version manager (nvm, mise, volta, fnm, asdf) are found even when the app is launched from Finder or at login — and also searches common Homebrew, local-user, and npm binary directories in addition to the process `PATH`.
 
 ## `REVIEW.md` policy
 
