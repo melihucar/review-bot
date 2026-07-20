@@ -144,6 +144,15 @@ final class ReviewedStateStore {
         keys.contains(key)
     }
 
+    /// Number of already-posted reviews whose dedup key starts with `prefix`.
+    /// Each posted review (new commit or re-request) adds one key, so this counts
+    /// how many review rounds a pull request has already had.
+    func count(withPrefix prefix: String) -> Int {
+        keys.reduce(into: 0) { total, key in
+            if key.hasPrefix(prefix) { total += 1 }
+        }
+    }
+
     func insert(_ key: String) {
         keys.insert(key)
         try? paths.prepare()

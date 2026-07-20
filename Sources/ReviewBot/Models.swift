@@ -61,6 +61,9 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var customPrompt: String
     var decisionPolicy: DecisionPolicy
     var reviewScope: ReviewScope
+    /// Maximum number of times a single pull request will be reviewed (across new
+    /// commits and re-requests). `nil` means unlimited.
+    var maxReviewRoundsPerPR: Int?
 
     static let `default` = ReviewBotConfiguration(
         repositories: [],
@@ -78,7 +81,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         ),
         customPrompt: "",
         decisionPolicy: .default,
-        reviewScope: .fullPullRequest
+        reviewScope: .fullPullRequest,
+        maxReviewRoundsPerPR: nil
     )
 
     private enum CodingKeys: String, CodingKey {
@@ -90,6 +94,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case customPrompt
         case decisionPolicy
         case reviewScope
+        case maxReviewRoundsPerPR
     }
 
     init(
@@ -100,7 +105,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         codex: ReviewerConfiguration,
         customPrompt: String,
         decisionPolicy: DecisionPolicy = .default,
-        reviewScope: ReviewScope = .fullPullRequest
+        reviewScope: ReviewScope = .fullPullRequest,
+        maxReviewRoundsPerPR: Int? = nil
     ) {
         self.repositories = repositories
         self.pollIntervalMinutes = pollIntervalMinutes
@@ -110,6 +116,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.customPrompt = customPrompt
         self.decisionPolicy = decisionPolicy
         self.reviewScope = reviewScope
+        self.maxReviewRoundsPerPR = maxReviewRoundsPerPR.map { max(1, $0) }
     }
 
     init(from decoder: Decoder) throws {
@@ -146,6 +153,11 @@ struct ReviewBotConfiguration: Codable, Equatable {
             ReviewScope.self,
             forKey: .reviewScope
         ) ?? .fullPullRequest
+        if let rounds = try values.decodeIfPresent(Int.self, forKey: .maxReviewRoundsPerPR) {
+            maxReviewRoundsPerPR = max(1, rounds)
+        } else {
+            maxReviewRoundsPerPR = nil
+        }
     }
 }
 

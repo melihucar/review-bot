@@ -297,6 +297,54 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertNil(incremental, "With no prior review there is nothing to diff incrementally against")
         XCTAssertTrue(usedGhDiff, "First review of a PR should use the full PR diff")
     }
+
+    func testReviewRoundCapSkipsPullRequestOnceLimitReached() async throws {
+        let fixture = try FeatureFixture()
+        // Two prior review rounds already recorded for PR #42.
+        let seed = ReviewedStateStore(paths: fixture.paths)
+        seed.insert("acme/widget#42@oldhead1@2026-07-14T10:00:00Z")
+        seed.insert("acme/widget#42@oldhead2@2026-07-15T09:00:00Z")
+
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.maxReviewRoundsPerPR = 2
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let posts = await runner.postCount()
+        let events = await recorder.snapshot()
+        XCTAssertEqual(posts, 0, "The PR already hit its review limit, so nothing should post")
+        XCTAssertFalse(events.contains { $0.kind == .reviewStarted })
+        XCTAssertFalse(events.contains { $0.kind == .requestDetected })
+    }
+
+    func testReviewRoundCapAllowsReviewBelowLimit() async throws {
+        let fixture = try FeatureFixture()
+        // Only one prior round recorded; a cap of 2 still allows one more.
+        let seed = ReviewedStateStore(paths: fixture.paths)
+        seed.insert("acme/widget#42@oldhead1@2026-07-14T10:00:00Z")
+
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.maxReviewRoundsPerPR = 2
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let posts = await runner.postCount()
+        XCTAssertEqual(posts, 1, "Below the limit, the PR should still be reviewed")
+    }
 }
 
 private struct FeatureFixture {

@@ -77,6 +77,7 @@ actor ReviewEngine {
                 let discovered = await discoverPendingReviews(
                     repository: repository,
                     githubUser: githubUser,
+                    maxRounds: configuration.maxReviewRoundsPerPR,
                     onEvent: onEvent,
                     onStatus: onStatus
                 )
@@ -113,6 +114,7 @@ actor ReviewEngine {
     private func discoverPendingReviews(
         repository: RepositoryConfiguration,
         githubUser: String,
+        maxRounds: Int?,
         onEvent: @escaping EventSink,
         onStatus: @escaping StatusSink
     ) async -> [PendingPullRequest] {
@@ -162,6 +164,17 @@ actor ReviewEngine {
                     )
                     let reviewKey = "\(repository.githubSlug)#\(pullRequest.number)@\(metadata.headRefOid)@\(requestMarker)"
                     guard !reviewedState.contains(reviewKey) else { continue }
+
+                    // Stop re-reviewing a PR once it has hit its configured round cap.
+                    if let maxRounds {
+                        let prPrefix = "\(repository.githubSlug)#\(pullRequest.number)@"
+                        if reviewedState.count(withPrefix: prPrefix) >= maxRounds {
+                            await logger.append(
+                                "Skipping \(repository.githubSlug)#\(pullRequest.number): reached the \(maxRounds)-review limit."
+                            )
+                            continue
+                        }
+                    }
 
                     await emit(
                         kind: .requestDetected,

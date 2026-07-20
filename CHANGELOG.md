@@ -11,6 +11,12 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-20
+
+### Added
+
+- A **re-review limit** setting (Reviewers tab): cap how many times a single pull request is reviewed across new commits and re-requests. Set an integer limit or leave it unlimited (default). Once a PR reaches the limit, further commits and re-requests on it are skipped.
+
 ## [0.1.5] - 2026-07-18
 
 ### Added
@@ -58,7 +64,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/melihucar/review-bot/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/melihucar/review-bot/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/melihucar/review-bot/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/melihucar/review-bot/compare/v0.1.2...v0.1.3

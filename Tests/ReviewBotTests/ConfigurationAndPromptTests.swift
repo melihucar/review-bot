@@ -21,6 +21,27 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertFalse(configuration.isPaused)
         XCTAssertEqual(configuration.customPrompt, "Focus on migrations")
         XCTAssertEqual(configuration.reviewScope, .fullPullRequest)
+        XCTAssertNil(configuration.maxReviewRoundsPerPR)
+    }
+
+    func testMaxReviewRoundsDecodesAndClampsToAtLeastOne() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true, "model": "claude", "effort": "high" },
+          "codex": { "enabled": false, "model": "codex", "effort": "medium" },
+          "customPrompt": "",
+          "maxReviewRoundsPerPR": 0
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        // 0 is meaningless as a cap; it is clamped up to 1.
+        XCTAssertEqual(configuration.maxReviewRoundsPerPR, 1)
     }
 
     func testReviewScopeDecodesWhenPresent() throws {

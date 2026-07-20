@@ -256,6 +256,8 @@ private struct ReviewersSettingsView: View {
                     Label("Review scope", systemImage: "arrow.left.and.right.text.vertical")
                 }
 
+                ReviewRoundLimitBox(settings: settings)
+
                 ToolStatusRow(
                     name: "GitHub CLI",
                     command: "gh",
@@ -289,6 +291,49 @@ private struct ReviewersSettingsView: View {
                 }
             }
             .padding(.top, 10)
+        }
+    }
+}
+
+private struct ReviewRoundLimitBox: View {
+    @ObservedObject var settings: SettingsStore
+
+    private var isLimited: Binding<Bool> {
+        Binding(
+            get: { settings.configuration.maxReviewRoundsPerPR != nil },
+            set: { settings.configuration.maxReviewRoundsPerPR = $0 ? 3 : nil }
+        )
+    }
+
+    private var roundCount: Binding<Int> {
+        Binding(
+            get: { settings.configuration.maxReviewRoundsPerPR ?? 3 },
+            set: { settings.configuration.maxReviewRoundsPerPR = max(1, $0) }
+        )
+    }
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Limit re-reviews per pull request", isOn: isLimited)
+
+                if let rounds = settings.configuration.maxReviewRoundsPerPR {
+                    Stepper(
+                        "Review each pull request up to \(rounds) time\(rounds == 1 ? "" : "s")",
+                        value: roundCount,
+                        in: 1...50
+                    )
+                }
+
+                Text(settings.configuration.maxReviewRoundsPerPR == nil
+                    ? "Unlimited: every new commit or re-request is reviewed."
+                    : "After the limit is reached, further commits and re-requests on that PR are skipped.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(8)
+        } label: {
+            Label("Re-review limit", systemImage: "arrow.clockwise.circle")
         }
     }
 }
