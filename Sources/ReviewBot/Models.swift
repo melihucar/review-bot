@@ -22,6 +22,22 @@ enum ReviewEffort: String, Codable, CaseIterable, Identifiable {
     static let codexCases: [ReviewEffort] = [.low, .medium, .high, .xhigh]
 }
 
+/// How much of a pull request each review looks at.
+enum ReviewScope: String, Codable, CaseIterable, Identifiable {
+    /// Review the entire base…head diff every time (default, original behavior).
+    case fullPullRequest = "full"
+    /// Review only what changed since the commit we last posted a review on.
+    case incremental = "incremental"
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .fullPullRequest: "Whole PR"
+        case .incremental: "New changes only"
+        }
+    }
+}
+
 struct ReviewerConfiguration: Codable, Equatable {
     var enabled: Bool
     var model: String
@@ -44,6 +60,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var codex: ReviewerConfiguration
     var customPrompt: String
     var decisionPolicy: DecisionPolicy
+    var reviewScope: ReviewScope
 
     static let `default` = ReviewBotConfiguration(
         repositories: [],
@@ -60,7 +77,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
             effort: .high
         ),
         customPrompt: "",
-        decisionPolicy: .default
+        decisionPolicy: .default,
+        reviewScope: .fullPullRequest
     )
 
     private enum CodingKeys: String, CodingKey {
@@ -71,6 +89,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case codex
         case customPrompt
         case decisionPolicy
+        case reviewScope
     }
 
     init(
@@ -80,7 +99,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         claude: ReviewerConfiguration,
         codex: ReviewerConfiguration,
         customPrompt: String,
-        decisionPolicy: DecisionPolicy = .default
+        decisionPolicy: DecisionPolicy = .default,
+        reviewScope: ReviewScope = .fullPullRequest
     ) {
         self.repositories = repositories
         self.pollIntervalMinutes = pollIntervalMinutes
@@ -89,6 +109,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.codex = codex
         self.customPrompt = customPrompt
         self.decisionPolicy = decisionPolicy
+        self.reviewScope = reviewScope
     }
 
     init(from decoder: Decoder) throws {
@@ -121,6 +142,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
             DecisionPolicy.self,
             forKey: .decisionPolicy
         ) ?? .default
+        reviewScope = try values.decodeIfPresent(
+            ReviewScope.self,
+            forKey: .reviewScope
+        ) ?? .fullPullRequest
     }
 }
 

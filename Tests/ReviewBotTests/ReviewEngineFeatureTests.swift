@@ -252,6 +252,51 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(postArgument, "--approve")
         XCTAssertEqual(events.last?.kind, .approved)
     }
+
+    func testIncrementalScopeDiffsAgainstLastReviewedHead() async throws {
+        let fixture = try FeatureFixture()
+        // A prior review recorded an earlier head; the mock's current head is 1234567890abcdef.
+        let priorHeads = LastReviewedStore(paths: fixture.paths)
+        priorHeads.record("acme/widget#42", head: "0000oldhead0000")
+
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.reviewScope = .incremental
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let incrementalArgs = await runner.incrementalDiffInvocation()
+        let incremental = try XCTUnwrap(incrementalArgs)
+        let usedGhDiff = await runner.didCallGhPrDiff()
+        XCTAssertEqual(Array(incremental.suffix(2)), ["0000oldhead0000", "1234567890abcdef"])
+        XCTAssertFalse(usedGhDiff, "Incremental review should not download the full PR diff")
+    }
+
+    func testIncrementalScopeFallsBackToFullDiffWithoutPriorHead() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.reviewScope = .incremental
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let incremental = await runner.incrementalDiffInvocation()
+        let usedGhDiff = await runner.didCallGhPrDiff()
+        XCTAssertNil(incremental, "With no prior review there is nothing to diff incrementally against")
+        XCTAssertTrue(usedGhDiff, "First review of a PR should use the full PR diff")
+    }
 }
 
 private struct FeatureFixture {
@@ -297,6 +342,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var postArgument = ""
     private var claudePrompt = ""
     private var preparedDiffSeen = false
+    private var ghPrDiffCalled = false
+    private var incrementalDiffArgs: [String]?
     private let failFirstPost: Bool
     private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
@@ -350,7 +397,16 @@ private actor ReviewWorkflowMock: CommandRunning {
         if executable == "git", arguments.contains("show") {
             return result(stdout: "Never approve an untested migration.\n")
         }
+        if executable == "git", arguments.contains("cat-file") {
+            // The prior-reviewed commit is present locally.
+            return result()
+        }
+        if executable == "git", arguments.contains("diff") {
+            incrementalDiffArgs = arguments
+            return result(stdout: "diff --git a/incremental.swift b/incremental.swift\n")
+        }
         if executable == "gh", arguments.starts(with: ["pr", "diff", "42"]) {
+            ghPrDiffCalled = true
             return result(stdout: "diff --git a/a.swift b/a.swift\n")
         }
         if executable == "gh", arguments.starts(with: ["pr", "view", "42"]),
@@ -429,6 +485,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastPostArgument() -> String { postArgument }
     func lastClaudePrompt() -> String { claudePrompt }
     func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
+    func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
+    func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
 
     private func result(
         exitCode: Int32 = 0,

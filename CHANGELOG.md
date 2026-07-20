@@ -11,6 +11,12 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-07-18
+
+### Added
+
+- A **review scope** setting (Reviewers tab): choose whether reviewers see the **whole PR** every time (default) or **only the new changes** since the last posted review. Incremental mode diffs the current head against the commit last reviewed, so reviewers focus on new work and don't re-flag already-reviewed code; it falls back to the whole PR on the first review, on a re-request with no new commits, or when the prior commit is no longer available locally.
+
 ## [0.1.4] - 2026-07-18
 
 ### Added
@@ -52,7 +58,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/melihucar/review-bot/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/melihucar/review-bot/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/melihucar/review-bot/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/melihucar/review-bot/compare/v0.1.1...v0.1.2

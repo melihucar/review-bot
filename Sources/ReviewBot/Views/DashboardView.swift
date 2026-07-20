@@ -234,6 +234,28 @@ private struct ReviewersSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Review")
+                                .frame(width: 70, alignment: .leading)
+                            Picker("Review scope", selection: $settings.configuration.reviewScope) {
+                                ForEach(ReviewScope.allCases) { scope in
+                                    Text(scope.label).tag(scope)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                        }
+                        Text("“Whole PR” reviews the entire diff every time. “New changes only” reviews just what changed since the last posted review, so reviewers don't re-flag already-reviewed code — it falls back to the whole PR on the first review or a re-request with no new commits.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                } label: {
+                    Label("Review scope", systemImage: "arrow.left.and.right.text.vertical")
+                }
+
                 ToolStatusRow(
                     name: "GitHub CLI",
                     command: "gh",

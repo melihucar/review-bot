@@ -23,6 +23,7 @@ actor ReviewEngine {
     private let paths: StoragePaths
     private let runner: any CommandRunning
     private let reviewedState: ReviewedStateStore
+    private let lastReviewed: LastReviewedStore
     private let logger: ActivityLogger
 
     private struct PendingPullRequest {
@@ -37,6 +38,7 @@ actor ReviewEngine {
         self.paths = paths
         self.runner = runner
         reviewedState = ReviewedStateStore(paths: paths)
+        lastReviewed = LastReviewedStore(paths: paths)
         logger = ActivityLogger(directory: paths.logsDirectory)
         try? paths.prepare()
     }
@@ -271,10 +273,16 @@ actor ReviewEngine {
             }
             worktreeAdded = true
 
+            let priorHead = lastReviewed.head(
+                for: "\(repository.githubSlug)#\(pullRequest.number)"
+            )
             try await prepareReviewContext(
                 number: pullRequest.number,
                 repository: repository,
-                worktree: worktree
+                worktree: worktree,
+                scope: configuration.reviewScope,
+                priorHead: priorHead,
+                currentHead: metadata.headRefOid
             )
 
             await emit(
@@ -364,6 +372,10 @@ actor ReviewEngine {
             }
 
             reviewedState.insert(pendingReview.reviewKey)
+            lastReviewed.record(
+                "\(repository.githubSlug)#\(pullRequest.number)",
+                head: metadata.headRefOid
+            )
             let verdicts = results.map {
                 "\($0.reviewer.rawValue): \($0.verdict?.rawValue ?? "unavailable")"
             }.joined(separator: ", ")
@@ -466,20 +478,52 @@ actor ReviewEngine {
     private func prepareReviewContext(
         number: Int,
         repository: RepositoryConfiguration,
-        worktree: URL
+        worktree: URL,
+        scope: ReviewScope,
+        priorHead: String?,
+        currentHead: String
     ) async throws {
-        let diff = try await runner.run(
-            "gh",
-            arguments: ["pr", "diff", String(number), "--repo", repository.githubSlug],
-            timeout: 120
-        )
-        guard diff.succeeded else {
-            throw ReviewEngineError.commandFailed("Could not download the PR diff: \(conciseError(diff))")
+        let narrowedDiff = scope == .incremental
+            ? await incrementalDiffText(
+                repository: repository,
+                priorHead: priorHead,
+                currentHead: currentHead
+            )
+            : nil
+
+        let diffText: String
+        if let narrowedDiff {
+            diffText = narrowedDiff
+        } else {
+            let diff = try await runner.run(
+                "gh",
+                arguments: ["pr", "diff", String(number), "--repo", repository.githubSlug],
+                timeout: 120
+            )
+            guard diff.succeeded else {
+                throw ReviewEngineError.commandFailed("Could not download the PR diff: \(conciseError(diff))")
+            }
+            diffText = diff.stdout
         }
-        try Data(diff.stdout.utf8).write(
+        try Data(diffText.utf8).write(
             to: worktree.appendingPathComponent(".review-bot-diff.patch"),
             options: .atomic
         )
+
+        // When we narrowed the diff to the new commits, tell the reviewers so they focus on the
+        // delta and don't re-flag already-reviewed code. Prepended to the thread they already read.
+        let scopeNote = narrowedDiff != nil && priorHead != nil
+            ? """
+            ## Review scope
+
+            This is an **incremental** review. `.review-bot-diff.patch` contains only the changes made \
+            since commit `\(priorHead!.prefix(8))`, which was already reviewed. The full pull request is \
+            checked out for context — read any file you need — but only flag defects in this delta; \
+            code from earlier commits is out of scope and was covered by the previous review.
+
+
+            """
+            : ""
 
         async let conversation = captureCommand {
             try await self.runner.run(
@@ -514,7 +558,7 @@ actor ReviewEngine {
         }
 
         let contextResults = await (conversation, reviews, inlineComments)
-        let thread = """
+        let thread = scopeNote + """
         ## Pull request and conversation
 
         \(contextResults.0.successfulOutput)
@@ -531,6 +575,35 @@ actor ReviewEngine {
             to: worktree.appendingPathComponent(".review-bot-thread.md"),
             options: .atomic
         )
+    }
+
+    /// The unified diff between the last-reviewed commit and the current head, or `nil` when an
+    /// incremental diff isn't possible or meaningful (no prior head, head unchanged, the prior
+    /// commit is no longer present locally, or the delta is empty). Callers fall back to the full
+    /// PR diff on `nil`.
+    private func incrementalDiffText(
+        repository: RepositoryConfiguration,
+        priorHead: String?,
+        currentHead: String
+    ) async -> String? {
+        guard let priorHead, priorHead != currentHead else { return nil }
+
+        // The prior commit may have been garbage-collected or force-pushed away; only diff against
+        // it if it is still an object we can read.
+        let exists = try? await runner.run(
+            "git",
+            arguments: ["-C", repository.path, "cat-file", "-e", "\(priorHead)^{commit}"],
+            timeout: 30
+        )
+        guard exists?.succeeded == true else { return nil }
+
+        let diff = try? await runner.run(
+            "git",
+            arguments: ["-C", repository.path, "diff", priorHead, currentHead],
+            timeout: 120
+        )
+        guard let diff, diff.succeeded else { return nil }
+        return diff.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : diff.stdout
     }
 
     private func runReviewers(

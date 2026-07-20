@@ -19,6 +19,7 @@ struct StoragePaths {
     var configFile: URL { root.appendingPathComponent("config.json") }
     var historyFile: URL { root.appendingPathComponent("history.json") }
     var reviewedFile: URL { root.appendingPathComponent("reviewed.json") }
+    var lastReviewedFile: URL { root.appendingPathComponent("last-reviewed.json") }
     var worktreesDirectory: URL { root.appendingPathComponent("worktrees", isDirectory: true) }
     var reviewsDirectory: URL { root.appendingPathComponent("reviews", isDirectory: true) }
     var logsDirectory: URL { root.appendingPathComponent("logs", isDirectory: true) }
@@ -149,6 +150,36 @@ final class ReviewedStateStore {
         let values = keys.sorted()
         guard let data = try? JSONEncoder().encode(values) else { return }
         try? data.write(to: paths.reviewedFile, options: .atomic)
+    }
+}
+
+/// Remembers the head commit each pull request was last reviewed at, so an
+/// incremental review can diff only the changes made since then.
+final class LastReviewedStore {
+    private let paths: StoragePaths
+    private var heads: [String: String]
+
+    init(paths: StoragePaths) {
+        self.paths = paths
+        if let data = try? Data(contentsOf: paths.lastReviewedFile),
+           let values = try? JSONDecoder().decode([String: String].self, from: data) {
+            heads = values
+        } else {
+            heads = [:]
+        }
+    }
+
+    func head(for key: String) -> String? {
+        heads[key]
+    }
+
+    func record(_ key: String, head: String) {
+        heads[key] = head
+        try? paths.prepare()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(heads) else { return }
+        try? data.write(to: paths.lastReviewedFile, options: .atomic)
     }
 }
 
