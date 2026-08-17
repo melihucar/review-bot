@@ -11,6 +11,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-08-17
+
 ### Added
 
 - **opencode as a third reviewer** (Reviewers tab). Off by default; when enabled it runs `opencode run` in the worktree under a dedicated read-only agent — every tool except Read/Grep/Glob is denied, project `opencode.json` and `.opencode` files shipped in the pull request cannot override that, and plugins are disabled (`--pure`). The default model is `opencode/deepseek-v4-flash-free` at **max** reasoning effort, since the model is free. It participates in the same parallel run, strictest-verdict aggregation, and reconciliation path as Claude and Codex.
@@ -78,7 +80,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/melihucar/review-bot/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/melihucar/review-bot/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/melihucar/review-bot/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/melihucar/review-bot/compare/v0.1.4...v0.1.5
