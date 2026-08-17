@@ -10,7 +10,7 @@ enum ReviewEngineError: LocalizedError {
         switch self {
         case let .commandFailed(message): message
         case let .invalidResponse(message): message
-        case .noReviewersEnabled: "Enable Claude or Codex before running reviews."
+        case .noReviewersEnabled: "Enable Claude, Codex, or opencode before running reviews."
         case let .reviewIncomplete(message): message
         }
     }
@@ -53,7 +53,9 @@ actor ReviewEngine {
             await onStatus("Add and enable a repository to begin")
             return
         }
-        guard configuration.claude.enabled || configuration.codex.enabled else {
+        guard configuration.claude.enabled
+            || configuration.codex.enabled
+            || configuration.opencode.enabled else {
             await onStatus(ReviewEngineError.noReviewersEnabled.localizedDescription)
             return
         }
@@ -629,37 +631,44 @@ actor ReviewEngine {
             repositoryRules: repositoryRules
         )
 
-        if configuration.claude.enabled, configuration.codex.enabled {
-            async let claude = runClaude(
-                configuration: configuration.claude,
-                prompt: prompt,
-                worktree: worktree
-            )
-            async let codex = runCodex(
-                configuration: configuration.codex,
-                prompt: prompt,
-                worktree: worktree
-            )
-            return await [claude, codex]
-        }
+        // Runs every enabled reviewer in parallel, preserving a deterministic
+        // output order (Claude, Codex, opencode) regardless of completion order.
+        let enabled: [(ReviewerName, ReviewerConfiguration)] = [
+            (.claude, configuration.claude),
+            (.codex, configuration.codex),
+            (.opencode, configuration.opencode),
+        ].filter { $0.1.enabled }
 
-        if configuration.claude.enabled {
-            return [await runClaude(
-                configuration: configuration.claude,
-                prompt: prompt,
-                worktree: worktree
-            )]
+        let order = Dictionary(uniqueKeysWithValues: enabled.enumerated().map { ($0.element.0, $0.offset) })
+        var results = await withTaskGroup(of: ReviewerResult.self) { group in
+            for (name, reviewer) in enabled {
+                group.addTask {
+                    switch name {
+                    case .claude:
+                        await self.runClaude(
+                            configuration: reviewer,
+                            prompt: prompt,
+                            worktree: worktree
+                        )
+                    case .codex:
+                        await self.runCodex(
+                            configuration: reviewer,
+                            prompt: prompt,
+                            worktree: worktree
+                        )
+                    case .opencode:
+                        await self.runOpencode(
+                            configuration: reviewer,
+                            prompt: prompt,
+                            worktree: worktree
+                        )
+                    }
+                }
+            }
+            return await group.reduce(into: []) { $0.append($1) }
         }
-
-        if configuration.codex.enabled {
-            return [await runCodex(
-                configuration: configuration.codex,
-                prompt: prompt,
-                worktree: worktree
-            )]
-        }
-
-        return []
+        results.sort { order[$0.reviewer, default: 0] < order[$1.reviewer, default: 0] }
+        return results
     }
 
     private func runReconciliation(
@@ -676,7 +685,8 @@ actor ReviewEngine {
                 )
             }
         )
-        // Both reviewers are enabled whenever verdicts disagree; prefer Claude as adjudicator.
+        // Reviewers are enabled whenever verdicts disagree; prefer Claude as
+        // adjudicator, then Codex, then opencode.
         if configuration.claude.enabled {
             return await runClaude(
                 configuration: configuration.claude,
@@ -684,8 +694,15 @@ actor ReviewEngine {
                 worktree: worktree
             )
         }
-        return await runCodex(
-            configuration: configuration.codex,
+        if configuration.codex.enabled {
+            return await runCodex(
+                configuration: configuration.codex,
+                prompt: prompt,
+                worktree: worktree
+            )
+        }
+        return await runOpencode(
+            configuration: configuration.opencode,
             prompt: prompt,
             worktree: worktree
         )
@@ -776,6 +793,85 @@ actor ReviewEngine {
             )
         } catch {
             return failedReviewer(.codex, configuration, message: error.localizedDescription)
+        }
+    }
+
+    private func runOpencode(
+        configuration: ReviewerConfiguration,
+        prompt: String,
+        worktree: URL
+    ) async -> ReviewerResult {
+        // The opencode reviewer runs as a dedicated read-only agent defined in
+        // Review Bot's own data directory (never inside the worktree, so a pull
+        // request can't supply it). The same deny-all-except-read permission map
+        // is also inlined via OPENCODE_CONFIG_CONTENT, which the merge order
+        // applies after any opencode.json the pull request itself ships.
+        guard ensureOpencodeAgent() else {
+            return failedReviewer(
+                .opencode,
+                configuration,
+                message: "could not write the read-only opencode agent file"
+            )
+        }
+        let permissions = #"{"permission":{"*":"deny","read":"allow","grep":"allow","glob":"allow"}}"#
+        do {
+            let result = try await runner.run(
+                "opencode",
+                arguments: [
+                    "run",
+                    "--agent", "review-bot",
+                    "--model", configuration.model,
+                    "--variant", configuration.effort.rawValue,
+                    "--pure",
+                    prompt,
+                ],
+                currentDirectory: worktree,
+                timeout: 900,
+                environment: [
+                    "OPENCODE_CONFIG_DIR": paths.opencodeConfigDirectory.path,
+                    "OPENCODE_CONFIG_CONTENT": permissions,
+                ]
+            )
+            guard result.succeeded else {
+                return failedReviewer(.opencode, configuration, message: conciseError(result))
+            }
+            return ReviewerResult(
+                reviewer: .opencode,
+                model: configuration.model,
+                output: result.stdout,
+                verdict: VerdictParser.parse(result.stdout),
+                failure: nil
+            )
+        } catch {
+            return failedReviewer(.opencode, configuration, message: error.localizedDescription)
+        }
+    }
+
+    /// Writes the read-only agent definition opencode runs reviewers under.
+    /// Returns `false` (and the reviewer then fails cleanly) if the file cannot
+    /// be created.
+    private func ensureOpencodeAgent() -> Bool {
+        let file = paths.opencodeAgentFile
+        do {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let agent = """
+            ---
+            description: Review Bot's read-only pull request reviewer
+            mode: all
+            permission:
+              "*": deny
+              read: allow
+              grep: allow
+              glob: allow
+            ---
+            """
+            try Data(agent.utf8).write(to: file, options: .atomic)
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -900,6 +996,9 @@ actor ReviewEngine {
         }
         if configuration.codex.enabled {
             reviewers.append("Codex (\(configuration.codex.effort.label))")
+        }
+        if configuration.opencode.enabled {
+            reviewers.append("opencode (\(configuration.opencode.effort.label))")
         }
         return "Running " + reviewers.joined(separator: " and ") + "."
     }

@@ -22,6 +22,28 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertEqual(configuration.customPrompt, "Focus on migrations")
         XCTAssertEqual(configuration.reviewScope, .fullPullRequest)
         XCTAssertNil(configuration.maxReviewRoundsPerPR)
+        // opencode is new, opt-in, and defaults to the free flash model at max effort.
+        XCTAssertFalse(configuration.opencode.enabled)
+        XCTAssertEqual(configuration.opencode.model, "opencode/deepseek-v4-flash-free")
+        XCTAssertEqual(configuration.opencode.effort, .max)
+    }
+
+    func testOpencodeConfigurationDecodesAndClampsEffortToMax() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "opencode": { "enabled": true, "model": "opencode/deepseek-v4-flash-free", "effort": "xhigh" }
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        // opencode's CLI accepts low/medium/high/max, so xhigh falls back to max.
+        XCTAssertTrue(configuration.opencode.enabled)
+        XCTAssertEqual(configuration.opencode.effort, .max)
     }
 
     func testMaxReviewRoundsDecodesAndClampsToAtLeastOne() throws {

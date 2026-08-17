@@ -16,6 +16,17 @@ protocol CommandRunning {
         currentDirectory: URL?,
         timeout: Int
     ) async throws -> CommandResult
+
+    /// Runs a command with extra environment variables merged over the process
+    /// environment. A default implementation is provided in an extension, so
+    /// mocks that only implement the environment-free variant keep working.
+    func run(
+        _ executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        timeout: Int,
+        environment: [String: String]?
+    ) async throws -> CommandResult
 }
 
 extension CommandRunning {
@@ -28,6 +39,21 @@ extension CommandRunning {
             executable,
             arguments: arguments,
             currentDirectory: nil,
+            timeout: timeout
+        )
+    }
+
+    func run(
+        _ executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        timeout: Int,
+        environment: [String: String]?
+    ) async throws -> CommandResult {
+        try await run(
+            executable,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
             timeout: timeout
         )
     }
@@ -143,12 +169,29 @@ struct ProcessRunner: CommandRunning {
         currentDirectory: URL? = nil,
         timeout: Int = 60
     ) async throws -> CommandResult {
+        try await run(
+            executable,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
+            timeout: timeout,
+            environment: nil
+        )
+    }
+
+    func run(
+        _ executable: String,
+        arguments: [String] = [],
+        currentDirectory: URL? = nil,
+        timeout: Int = 60,
+        environment: [String: String]?
+    ) async throws -> CommandResult {
         try await Task.detached(priority: .utility) {
             try runSynchronously(
                 executable,
                 arguments: arguments,
                 currentDirectory: currentDirectory,
-                timeout: timeout
+                timeout: timeout,
+                environmentOverrides: environment
             )
         }.value
     }
@@ -157,7 +200,8 @@ struct ProcessRunner: CommandRunning {
         _ executable: String,
         arguments: [String],
         currentDirectory: URL?,
-        timeout: Int
+        timeout: Int,
+        environmentOverrides: [String: String]? = nil
     ) throws -> CommandResult {
         let temporaryDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("review-bot-command-\(UUID().uuidString)", isDirectory: true)
@@ -192,6 +236,11 @@ struct ProcessRunner: CommandRunning {
 
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = Self.augmentedPath
+        if let environmentOverrides {
+            for (key, value) in environmentOverrides {
+                environment[key] = value
+            }
+        }
         process.environment = environment
 
         try process.run()

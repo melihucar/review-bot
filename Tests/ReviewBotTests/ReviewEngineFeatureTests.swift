@@ -201,6 +201,65 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(events.last?.kind, .changesRequested)
     }
 
+    func testOpencodeOnlyReviewPostsApproval() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(opencodeVerdict: .clean)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.opencode.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let claudeCount = await runner.claudeCount()
+        let codexCount = await runner.codexCount()
+        let opencodeCount = await runner.opencodeCount()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(claudeCount, 0)
+        XCTAssertEqual(codexCount, 0)
+        XCTAssertEqual(opencodeCount, 1)
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertEqual(events.last?.kind, .approved)
+    }
+
+    func testAllThreeReviewersRunInParallelAndPost() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .clean,
+            opencodeVerdict: .clean
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+        configuration.opencode.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let claudeCount = await runner.claudeCount()
+        let codexCount = await runner.codexCount()
+        let opencodeCount = await runner.opencodeCount()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(claudeCount, 1)
+        XCTAssertEqual(codexCount, 1)
+        XCTAssertEqual(opencodeCount, 1)
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertTrue(postedBody.contains("opencode: `CLEAN`"))
+    }
+
     func testPolicyBlockingOnNitsRequestsChanges() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(codexVerdict: .nitsOnly)
@@ -369,6 +428,7 @@ private struct FeatureFixture {
             isPaused: false,
             claude: ReviewerConfiguration(enabled: true, model: "claude-test", effort: .high),
             codex: ReviewerConfiguration(enabled: false, model: "codex-test", effort: .high),
+            opencode: ReviewerConfiguration(enabled: false, model: "opencode-test", effort: .max),
             customPrompt: "Check public API compatibility."
         )
     }
@@ -385,6 +445,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var posts = 0
     private var claudeRuns = 0
     private var codexRuns = 0
+    private var opencodeRuns = 0
     private var reconciliationRuns = 0
     private var postedBody = ""
     private var postArgument = ""
@@ -395,6 +456,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let failFirstPost: Bool
     private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
+    private let opencodeVerdict: ReviewVerdict
     private let reconciledVerdict: ReviewVerdict?
     private let failCodex: Bool
 
@@ -402,12 +464,14 @@ private actor ReviewWorkflowMock: CommandRunning {
         failFirstPost: Bool = false,
         claudeVerdict: ReviewVerdict = .clean,
         codexVerdict: ReviewVerdict = .clean,
+        opencodeVerdict: ReviewVerdict = .clean,
         reconciledVerdict: ReviewVerdict? = nil,
         failCodex: Bool = false
     ) {
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
         self.codexVerdict = codexVerdict
+        self.opencodeVerdict = opencodeVerdict
         self.reconciledVerdict = reconciledVerdict
         self.failCodex = failCodex
     }
@@ -500,6 +564,10 @@ private actor ReviewWorkflowMock: CommandRunning {
             }
             return result()
         }
+        if executable == "opencode" {
+            opencodeRuns += 1
+            return result(stdout: "## Summary\nopencode result.\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
+        }
         if executable == "gh", arguments.starts(with: ["pr", "review", "42"]) {
             posts += 1
             postArgument = arguments.first(where: {
@@ -528,6 +596,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func postCount() -> Int { posts }
     func claudeCount() -> Int { claudeRuns }
     func codexCount() -> Int { codexRuns }
+    func opencodeCount() -> Int { opencodeRuns }
     func reconciliationCount() -> Int { reconciliationRuns }
     func lastPostedBody() -> String { postedBody }
     func lastPostArgument() -> String { postArgument }

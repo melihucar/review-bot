@@ -23,9 +23,18 @@ struct StoragePaths {
     var worktreesDirectory: URL { root.appendingPathComponent("worktrees", isDirectory: true) }
     var reviewsDirectory: URL { root.appendingPathComponent("reviews", isDirectory: true) }
     var logsDirectory: URL { root.appendingPathComponent("logs", isDirectory: true) }
+    /// Configuration Review Bot injects into the opencode reviewer (read-only
+    /// sandbox agent). Lives outside the worktree so a pull request can't
+    /// influence its contents.
+    var opencodeConfigDirectory: URL {
+        root.appendingPathComponent("opencode", isDirectory: true)
+    }
+    var opencodeAgentFile: URL {
+        opencodeConfigDirectory.appendingPathComponent("agents/review-bot.md")
+    }
 
     func prepare() throws {
-        for directory in [root, worktreesDirectory, reviewsDirectory, logsDirectory] {
+        for directory in [root, worktreesDirectory, reviewsDirectory, logsDirectory, opencodeConfigDirectory] {
             try FileManager.default.createDirectory(
                 at: directory,
                 withIntermediateDirectories: true
