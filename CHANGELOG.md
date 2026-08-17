@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Changed
+
+- CI and release workflows now run on the Node 24 action runtime: `actions/checkout@v5` and `softprops/action-gh-release@v3` (both actions previously used the deprecated Node 20 runtime).
+
 ## [0.1.8] - 2026-08-17
 
 ### Added

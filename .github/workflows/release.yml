@@ -13,7 +13,7 @@ jobs:
     name: Build DMG and publish release
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Extract release notes from CHANGELOG
         run: |
@@ -46,7 +46,7 @@ jobs:
         run: ./scripts/build-dmg.sh "${{ github.ref_name }}"
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/ReviewBot-*.dmg
           body_path: release-notes.md
