@@ -16,10 +16,11 @@ enum ReviewEffort: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    // Claude and Codex expose different top-tier effort names, so each reviewer
-    // only offers the levels its CLI accepts.
+    // Claude, Codex, and opencode expose different top-tier effort names, so
+    // each reviewer only offers the levels its CLI accepts.
     static let claudeCases: [ReviewEffort] = [.low, .medium, .high, .max]
     static let codexCases: [ReviewEffort] = [.low, .medium, .high, .xhigh]
+    static let opencodeCases: [ReviewEffort] = [.low, .medium, .high, .max]
 }
 
 /// How much of a pull request each review looks at.
@@ -58,6 +59,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var isPaused: Bool
     var claude: ReviewerConfiguration
     var codex: ReviewerConfiguration
+    var opencode: ReviewerConfiguration
     var customPrompt: String
     var decisionPolicy: DecisionPolicy
     var reviewScope: ReviewScope
@@ -71,13 +73,20 @@ struct ReviewBotConfiguration: Codable, Equatable {
         isPaused: false,
         claude: ReviewerConfiguration(
             enabled: true,
-            model: "claude-opus-4-8",
-            effort: .max
+            model: "claude-opus-5",
+            effort: .high
         ),
         codex: ReviewerConfiguration(
             enabled: true,
             model: "gpt-5.6-sol",
             effort: .high
+        ),
+        // opencode is opt-in: the deepseek-v4-flash-free model is free, so the
+        // default pairs it with max reasoning effort at no cost.
+        opencode: ReviewerConfiguration(
+            enabled: false,
+            model: "opencode/deepseek-v4-flash-free",
+            effort: .max
         ),
         customPrompt: "",
         decisionPolicy: .default,
@@ -91,6 +100,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case isPaused
         case claude
         case codex
+        case opencode
         case customPrompt
         case decisionPolicy
         case reviewScope
@@ -103,6 +113,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         isPaused: Bool,
         claude: ReviewerConfiguration,
         codex: ReviewerConfiguration,
+        opencode: ReviewerConfiguration,
         customPrompt: String,
         decisionPolicy: DecisionPolicy = .default,
         reviewScope: ReviewScope = .fullPullRequest,
@@ -113,6 +124,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.isPaused = isPaused
         self.claude = claude
         self.codex = codex
+        self.opencode = opencode
         self.customPrompt = customPrompt
         self.decisionPolicy = decisionPolicy
         self.reviewScope = reviewScope
@@ -138,11 +150,18 @@ struct ReviewBotConfiguration: Codable, Equatable {
             ReviewerConfiguration.self,
             forKey: .codex
         ) ?? ReviewBotConfiguration.default.codex
+        opencode = try values.decodeIfPresent(
+            ReviewerConfiguration.self,
+            forKey: .opencode
+        ) ?? ReviewBotConfiguration.default.opencode
         if !ReviewEffort.claudeCases.contains(claude.effort) {
-            claude.effort = .max
+            claude.effort = .high
         }
         if !ReviewEffort.codexCases.contains(codex.effort) {
             codex.effort = .high
+        }
+        if !ReviewEffort.opencodeCases.contains(opencode.effort) {
+            opencode.effort = .max
         }
         customPrompt = try values.decodeIfPresent(String.self, forKey: .customPrompt) ?? ""
         decisionPolicy = try values.decodeIfPresent(
@@ -229,6 +248,7 @@ struct ReviewQueueItem: Equatable, Identifiable {
 enum ReviewerName: String, Codable, CaseIterable {
     case claude = "Claude"
     case codex = "Codex"
+    case opencode = "opencode"
 }
 
 enum ReviewVerdict: String, Codable, CaseIterable {

@@ -11,6 +11,14 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Added
+
+- **opencode as a third reviewer** (Reviewers tab). Off by default; when enabled it runs `opencode run` in the worktree under a dedicated read-only agent — every tool except Read/Grep/Glob is denied, project `opencode.json` and `.opencode` files shipped in the pull request cannot override that, and plugins are disabled (`--pure`). The default model is `opencode/deepseek-v4-flash-free` at **max** reasoning effort, since the model is free. It participates in the same parallel run, strictest-verdict aggregation, and reconciliation path as Claude and Codex.
+
+### Changed
+
+- The default Claude reviewer is now `claude-opus-5` at **high** effort (was `claude-opus-4-8` at max). Existing configurations keep the model and effort they already have; only fresh installs and out-of-range effort values pick up the new default.
+
 ## [0.1.7] - 2026-07-20
 
 ### Fixed

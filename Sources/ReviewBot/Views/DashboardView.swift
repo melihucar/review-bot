@@ -266,6 +266,7 @@ private struct ReviewersSettingsView: View {
 
                 ReviewerCard(
                     title: "Claude",
+                    icon: "brain.head.profile",
                     command: "claude",
                     configuration: $settings.configuration.claude,
                     efforts: ReviewEffort.claudeCases,
@@ -274,14 +275,24 @@ private struct ReviewersSettingsView: View {
 
                 ReviewerCard(
                     title: "Codex",
+                    icon: "terminal.fill",
                     command: "codex",
                     configuration: $settings.configuration.codex,
                     efforts: ReviewEffort.codexCases,
                     isAvailable: model.toolAvailability["codex"] == true
                 )
 
+                ReviewerCard(
+                    title: "opencode",
+                    icon: "chevron.left.forwardslash.chevron.right",
+                    command: "opencode",
+                    configuration: $settings.configuration.opencode,
+                    efforts: ReviewEffort.opencodeCases,
+                    isAvailable: model.toolAvailability["opencode"] == true
+                )
+
                 HStack {
-                    Text("At least one AI reviewer must be enabled.")
+                    Text("At least one AI reviewer must be enabled. opencode is off by default; it runs the free `opencode/deepseek-v4-flash-free` model at max reasoning effort in a read-only sandbox.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -340,6 +351,7 @@ private struct ReviewRoundLimitBox: View {
 
 private struct ReviewerCard: View {
     let title: String
+    let icon: String
     let command: String
     @Binding var configuration: ReviewerConfiguration
     let efforts: [ReviewEffort]
@@ -379,7 +391,7 @@ private struct ReviewerCard: View {
             }
             .padding(8)
         } label: {
-            Label(title, systemImage: title == "Claude" ? "brain.head.profile" : "terminal.fill")
+            Label(title, systemImage: icon)
         }
     }
 }
