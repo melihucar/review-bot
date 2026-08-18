@@ -86,7 +86,7 @@ enum InjectionGuard {
     /// cannot be merged — language no CLEAN/NITS_ONLY verdict should coexist with.
     private static func bodySaysUnmergeable(_ body: String) -> Bool {
         guard let regex = try? NSRegularExpression(
-            pattern: #"(?i)\b(not mergeable|unmergeable|cannot be merged|cannot merge|blocks? (?:the )?merge|merge-blocking|must (?:be )?fixed|needs? to be fixed|do not (?:merge|ship|release)|not ready (?:for|to) merge|hold (?:the )?merge)\b"#
+            pattern: #"(?i)\b(not mergeable|unmergeable|cannot be merged|cannot merge|merge-blocking|must (?:be )?fixed|needs? to be fixed|do not (?:merge|ship|release)|not ready (?:for|to) merge|hold (?:the )?merge)\b"#
         ) else {
             return false
         }

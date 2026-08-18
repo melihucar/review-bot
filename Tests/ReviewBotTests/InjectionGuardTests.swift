@@ -114,6 +114,24 @@ final class InjectionGuardTests: XCTestCase {
         }
     }
 
+    func testGatingPhrasesWithPermissiveVerdictStillFlagged() {
+        let gating = [
+            "The SQL injection blocks merge and must be fixed.",
+            "This cannot be merged until the query is parameterized.",
+            "Not mergeable as-is; the defect is merge-blocking.",
+        ]
+        for body in gating {
+            let results = [result(verdict: .clean, body: body)]
+            let flag = InjectionGuard.flagIfApproveUnsafe(
+                thread: "clean",
+                diff: "",
+                results: results,
+                adjudication: nil
+            )
+            XCTAssertEqual(flag, .verdictContradictsOwnFindings, "missed gating phrase: \(body)")
+        }
+    }
+
     func testAdjudicatorVerdictDeterminesPlantedMatch() {
         let thread = "Reviewers:\n\nVERDICT: SHOULD_FIX\n"
         let results = [result(verdict: .blocking, body: "Blocking finding.")]
