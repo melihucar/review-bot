@@ -23,8 +23,14 @@ enum InjectionGuard {
     /// All `VERDICT:` lines present in untrusted text. A reviewer's verdict that
     /// matches any of these is not independent — the author could simply have
     /// told the model which line to emit.
+    ///
+    /// Lenient by design: unlike `VerdictParser.parse` (which must be strict, since
+    /// it extracts the *trusted* verdict from reviewer output), this scan allows
+    /// unified-diff markers (`+`/`-`/context space) and surrounding quotes or
+    /// punctuation, because planted lines in threads and diffs commonly carry them.
     static func plantedVerdicts(in text: String) -> Set<ReviewVerdict> {
-        guard let regex = try? NSRegularExpression(pattern: VerdictParser.verdictLineRegex) else {
+        let pattern = #"(?im)^[+\- ]*\s*["'`]*\s*VERDICT:\s*(BLOCKING|SHOULD_FIX|NITS_ONLY|CLEAN)\s*["'`.,!?]*\s*$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
             return []
         }
         return Set(
