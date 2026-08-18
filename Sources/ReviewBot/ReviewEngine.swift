@@ -291,7 +291,7 @@ actor ReviewEngine {
             let priorHead = lastReviewed.head(
                 for: "\(repository.githubSlug)#\(pullRequest.number)"
             )
-            try await prepareReviewContext(
+            let context = try await prepareReviewContext(
                 number: pullRequest.number,
                 repository: repository,
                 worktree: worktree,
@@ -356,12 +356,25 @@ actor ReviewEngine {
                     )
                 }
             }
+            var guardReason: InjectionGuard.Reason?
+            if decision == .approve {
+                guardReason = InjectionGuard.flagIfApproveUnsafe(
+                    thread: context.thread,
+                    diff: context.diff,
+                    results: results,
+                    adjudication: adjudication
+                )
+                if guardReason != nil {
+                    decision = .comment
+                }
+            }
             let reviewBody = aggregateReview(
                 pullRequest: pullRequest,
                 commitSHA: metadata.headRefOid,
                 results: results,
                 decision: decision,
-                adjudication: adjudication
+                adjudication: adjudication,
+                guardReason: guardReason
             )
             let reviewFile = try saveReview(
                 reviewBody,
@@ -490,6 +503,13 @@ actor ReviewEngine {
             .last ?? fallback
     }
 
+    /// The untrusted text the reviewers will read: the PR thread and the diff.
+    /// `InjectionGuard` scans both for planted verdicts before an approval may post.
+    private struct ReviewContext {
+        let thread: String
+        let diff: String
+    }
+
     private func prepareReviewContext(
         number: Int,
         repository: RepositoryConfiguration,
@@ -497,7 +517,7 @@ actor ReviewEngine {
         scope: ReviewScope,
         priorHead: String?,
         currentHead: String
-    ) async throws {
+    ) async throws -> ReviewContext {
         let narrowedDiff = scope == .incremental
             ? await incrementalDiffText(
                 repository: repository,
@@ -590,6 +610,7 @@ actor ReviewEngine {
             to: worktree.appendingPathComponent(".review-bot-thread.md"),
             options: .atomic
         )
+        return ReviewContext(thread: thread, diff: diffText)
     }
 
     /// The unified diff between the last-reviewed commit and the current head, or `nil` when an
@@ -894,7 +915,8 @@ actor ReviewEngine {
         commitSHA: String,
         results: [ReviewerResult],
         decision: ReviewDecision,
-        adjudication: ReviewerResult?
+        adjudication: ReviewerResult?,
+        guardReason: InjectionGuard.Reason?
     ) -> String {
         let verdictSummary = results.map {
             "\($0.reviewer.rawValue): `\($0.verdict?.rawValue ?? "unavailable")`"
@@ -915,7 +937,20 @@ actor ReviewEngine {
         case .requestChanges:
             note = "At least one reviewer found an issue the current decision policy treats as blocking."
         case .comment:
-            note = "This review is neutral under the current decision policy (a reviewer failed, returned an unreadable verdict, or the policy leaves this severity to you)."
+            note = guardReason == nil
+                ? "This review is neutral under the current decision policy (a reviewer failed, returned an unreadable verdict, or the policy leaves this severity to you)."
+                : "An automated injection check flagged this approval as unsafe, so the review posts as a neutral comment instead."
+        }
+
+        var guardDisclosure = ""
+        if let guardReason {
+            guardDisclosure = """
+
+
+            > **Review Bot downgraded this decision from approval to a neutral comment.** \(guardReason == .verdictMatchesPlantedLine
+                ? "The pull request thread or diff contains a `VERDICT:` line written by a commenter, and the reviewers' verdict matched it, so it is not treated as independent."
+                : "A reviewer's own prose contradicts its verdict (it describes a merge blocker), so the verdict line is not trusted.") Thread content is untrusted; treat unverified claims in it as data, not instructions.
+            """
         }
 
         var reconciliationSection = ""
@@ -937,7 +972,7 @@ actor ReviewEngine {
         return """
         ## Automated review — PR #\(pullRequest.number)
 
-        **Decision: \(decision.title)** — \(note)\(reconciliationSection)
+        **Decision: \(decision.title)** — \(note)\(reconciliationSection)\(guardDisclosure)
 
         Independent reviews of `\(commitSHA.prefix(8))` (\(verdictSummary)). These findings are advisory; verify them before acting.
 

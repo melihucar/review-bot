@@ -1,9 +1,13 @@
 import Foundation
 
 enum VerdictParser {
+    /// The machine-readable verdict line a reviewer must end with. Shared by the
+    /// parser and `InjectionGuard` (which scans untrusted thread/diff text for
+    /// planted lines that would match).
+    static let verdictLineRegex = #"(?im)^\s*VERDICT:\s*(BLOCKING|SHOULD_FIX|NITS_ONLY|CLEAN)\s*$"#
+
     static func parse(_ output: String) -> ReviewVerdict? {
-        let pattern = #"(?im)^\s*VERDICT:\s*(BLOCKING|SHOULD_FIX|NITS_ONLY|CLEAN)\s*$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
+        guard let regex = try? NSRegularExpression(pattern: verdictLineRegex),
               let match = regex.matches(
                 in: output,
                 range: NSRange(output.startIndex..., in: output)

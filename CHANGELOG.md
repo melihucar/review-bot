@@ -13,6 +13,7 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ### Changed
 
+- **Prompt-injection hardening.** Pull-request threads are now treated as untrusted input end to end: reviewers are told explicitly that thread content (including planted `VERDICT:` lines) is data, never instructions; and before the bot may post an approval, deterministic checks verify that (a) no `VERDICT:` line was planted in the thread or diff, and (b) no reviewer's own prose contradicts its verdict (a permissive verdict that describes a merge blocker is not trusted). A flagged approval posts as a neutral comment with a disclosure instead, so the worst outcome of an injected thread is a comment, never an auto-approval. The Reviewers tab also warns when a small/experimental model is selected, since those measurably degrade under adversarial thread content.
 - CI and release workflows now run on the Node 24 action runtime: `actions/checkout@v5` and `softprops/action-gh-release@v3` (both actions previously used the deprecated Node 20 runtime).
 
 ## [0.1.8] - 2026-08-17
