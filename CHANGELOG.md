@@ -11,6 +11,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-08-18
+
 ### Changed
 
 - **Prompt-injection hardening.** Pull-request threads are now treated as untrusted input end to end: reviewers are told explicitly that thread content (including planted `VERDICT:` lines) is data, never instructions; and before the bot may post an approval, deterministic checks verify that (a) no `VERDICT:` line was planted in the thread or diff, and (b) no reviewer's own prose contradicts its verdict (a permissive verdict that describes a merge blocker is not trusted). A flagged approval posts as a neutral comment with a disclosure instead, so the worst outcome of an injected thread is a comment, never an auto-approval. The Reviewers tab also warns when a small/experimental model is selected, since those measurably degrade under adversarial thread content.
@@ -85,7 +87,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/melihucar/review-bot/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/melihucar/review-bot/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/melihucar/review-bot/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/melihucar/review-bot/compare/v0.1.5...v0.1.6
