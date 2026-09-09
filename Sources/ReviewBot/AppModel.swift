@@ -10,6 +10,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var lastCheckDate: Date?
     @Published private(set) var toolAvailability: [String: Bool] = [:]
+    @Published private(set) var reviewersWithSavedKey: Set<ReviewerName> = []
     @Published private(set) var launchAtLoginEnabled: Bool
     @Published private(set) var pendingReviews: [ReviewQueueItem] = []
     /// Every review running right now — a poll reviews several pull requests at once,
@@ -24,17 +25,22 @@ final class AppModel: ObservableObject {
 
     private let paths: StoragePaths
     private let runner: any CommandRunning
+    private let credentials: any CredentialStoring
     private let engine: ReviewEngine
     private var schedulerTask: Task<Void, Never>?
     private var settingsWindowController: NSWindowController?
     private var hasStarted = false
 
-    init(paths: StoragePaths = StoragePaths()) {
+    init(
+        paths: StoragePaths = StoragePaths(),
+        credentials: any CredentialStoring = KeychainCredentialStore()
+    ) {
         self.paths = paths
+        self.credentials = credentials
         runner = ProcessRunner()
         settings = SettingsStore(paths: paths)
         history = HistoryStore(paths: paths)
-        engine = ReviewEngine(paths: paths, runner: runner)
+        engine = ReviewEngine(paths: paths, runner: runner, credentials: credentials)
         launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
     }
 
@@ -79,11 +85,124 @@ final class AppModel: ObservableObject {
 
     func refreshToolAvailability() async {
         var statuses: [String: Bool] = [:]
-        for tool in ["gh", "claude", "codex", "opencode"] {
+        // The probe list is derived from the reviewers rather than written out, so a reviewer
+        // added to `ReviewerName` is checked without a second edit here.
+        for tool in ["gh"] + ReviewerName.allCases.compactMap(\.commandName) {
             let result = try? await runner.run("which", arguments: [tool], timeout: 10)
             statuses[tool] = result?.succeeded == true
         }
         toolAvailability = statuses
+        await refreshSavedKeys()
+    }
+
+    /// Which reviewers have a key available — from the Keychain, or from the environment, which
+    /// takes precedence over it.
+    ///
+    /// Only reviewers actually configured for key auth are looked up: reading a Keychain item
+    /// can prompt for access on an ad-hoc-signed build, and a developer using signed-in CLIs
+    /// should never see that prompt. An environment-supplied key is answered without touching
+    /// the Keychain at all, so it cannot prompt.
+    ///
+    /// The read happens off the main actor, which is why this is `async`. A Keychain prompt
+    /// blocks the thread that raises it until the user answers, and blocking this one freezes
+    /// the settings window that is asking the question.
+    func refreshSavedKeys() async {
+        let resolved = await ResolvedCredentials.resolve(
+            ReviewerName.allCases.filter { reviewer in
+                reviewer.supportsAPIKeyAuth
+                    && settings.configuration.settings(for: reviewer).authMode == .apiKey
+            },
+            from: credentials
+        )
+        reviewersWithSavedKey = resolved.reviewersWithKey
+    }
+
+    /// What a Keychain write left in effect, read back on the same detached task that performed
+    /// the write so the panel and the status line can never disagree about it.
+    private struct CredentialWriteOutcome: Sendable {
+        var effective: String?
+        var failure: String?
+    }
+
+    func saveAPIKey(_ key: String, for reviewer: ReviewerName) async {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        let outcome = await performCredentialWrite(for: reviewer) { store in
+            try store.setAPIKey(trimmed, for: reviewer)
+        }
+        if let failure = outcome.failure {
+            errorMessage = "Could not save the \(reviewer.rawValue) API key: \(failure)"
+            return
+        }
+        updateSavedKeyPanel(outcome, for: reviewer)
+        if outcome.effective == nil {
+            // The write succeeded but reading it back did not, which on an ad-hoc-signed build
+            // means the Keychain prompt was denied. Reporting a plain "Saved" here would leave
+            // the panel below saying no key is saved, and the next review failing for a reason
+            // nothing on screen explained.
+            status = """
+            Saved the \(reviewer.rawValue) API key, but it could not be read back — allow \
+            Review Bot access when macOS asks, or \(reviewer.rawValue) reviews will fail
+            """
+        } else if outcome.effective != trimmed {
+            // The environment takes precedence over the Keychain, so a variable left over in
+            // this app's environment would shadow the key that was just saved. Say so rather
+            // than report a save that will not be the one used.
+            status = """
+            Saved the \(reviewer.rawValue) API key, but \
+            \(reviewer.apiKeyOverrideEnvironmentVariable) is set in this app's environment \
+            and takes precedence over it
+            """
+        } else {
+            status = "Saved the \(reviewer.rawValue) API key to your Keychain"
+        }
+    }
+
+    func removeAPIKey(for reviewer: ReviewerName) async {
+        let outcome = await performCredentialWrite(for: reviewer) { store in
+            try store.removeAPIKey(for: reviewer)
+        }
+        if let failure = outcome.failure {
+            errorMessage = "Could not remove the \(reviewer.rawValue) API key: \(failure)"
+            return
+        }
+        updateSavedKeyPanel(outcome, for: reviewer)
+        // A key that still resolves after removal can only be coming from the environment,
+        // and reporting a bare "Removed" would imply the reviewer had stopped being billed.
+        if outcome.effective != nil {
+            status = """
+            Removed the \(reviewer.rawValue) API key from your Keychain, but \
+            \(reviewer.apiKeyOverrideEnvironmentVariable) is still set in this app's \
+            environment and will be used
+            """
+        } else {
+            status = "Removed the \(reviewer.rawValue) API key from your Keychain"
+        }
+    }
+
+    /// Performs one Keychain write off the main actor and reads back what it left in effect.
+    private func performCredentialWrite(
+        for reviewer: ReviewerName,
+        _ body: @escaping @Sendable (any CredentialStoring) throws -> Void
+    ) async -> CredentialWriteOutcome {
+        let store = credentials
+        return await Task.detached(priority: .userInitiated) {
+            do {
+                try body(store)
+                return CredentialWriteOutcome(effective: store.apiKey(for: reviewer))
+            } catch {
+                return CredentialWriteOutcome(failure: error.localizedDescription)
+            }
+        }.value
+    }
+
+    /// Updates the panel from the write's own read-back rather than a second Keychain round
+    /// trip, so a denied read cannot make the status line and the panel tell different stories.
+    private func updateSavedKeyPanel(_ outcome: CredentialWriteOutcome, for reviewer: ReviewerName) {
+        if outcome.effective == nil {
+            reviewersWithSavedKey.remove(reviewer)
+        } else {
+            reviewersWithSavedKey.insert(reviewer)
+        }
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
