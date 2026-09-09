@@ -11,6 +11,15 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Added
+
+- **Reviewer time limits are configurable.** Every reviewer was fixed at 15 minutes, and a pull request that ran over produced nothing at all — the reviewer was cut off at exactly 900 seconds and the panel shrank to whoever else finished. Each reviewer card now carries a **Time limit** stepper (1–240 minutes, default 15). It is per reviewer rather than global so raising one to finish a large diff does not silently raise the rest, and decoding clamps the value, since this one bounds a running process.
+
+### Fixed
+
+- **A pull request too large for GitHub's diff API is now reviewed from the local clone.** `gh pr diff` answers anything over 20,000 lines with an HTTP 406, which is a property of the API rather than of the pull request — so the review failed, retried, and burned its whole failure budget on a condition no retry could ever get past. Review Bot already fetches both the pull request head and its base branch before the review starts, so the same three-dot diff is now computed locally when the API refuses, with no line ceiling. `git diff base...head` is exactly what `gh pr diff` asks the API to render, so reviewers cannot tell which route produced the patch; a review only fails now if the clone cannot produce the diff either, and the message says so rather than pointing at GitHub's limit alone.
+- **A reviewer that says it could not assess a pull request no longer produces an approval.** The review contract requires a trailing verdict line, so a reviewer that spent its whole turn failing to reach the diff still signed off with `NITS_ONLY` — "I found no problems" being literally true of a review that looked at nothing — and the panel read that as an approval. The body now overrides the verdict line: a review that states in its own words that it could not be assessed has its verdict withdrawn and does not count toward the decision, and it is not re-run inside the same review, because a second pass re-reads the same unreadable evidence. If another reviewer did finish, the decision is theirs and the withdrawal is disclosed in the posted body. If none did, Review Bot now posts a neutral comment carrying each reviewer's own account of why, rather than staying silent and retrying until the failure budget gives up without ever telling the author anything.
+
 ## [0.1.16] - 2026-09-09
 
 ### Added

@@ -231,4 +231,97 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertTrue(prompt.contains("do not average them, and do not defer to the strictest by default"))
         XCTAssertTrue(prompt.contains("absence of evidence, not agreement"))
     }
+
+    // MARK: - Reviewer time limit
+
+    func testTheTimeLimitDefaultsToWhatEveryReviewerUsedBeforeItWasConfigurable() throws {
+        let json = #"{"claude":{"enabled":true,"model":"claude-opus-5","effort":"high"}}"#
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(configuration.claude.timeoutMinutes, 15)
+        XCTAssertEqual(configuration.claude.timeoutSeconds, 900)
+    }
+
+    func testAnOutOfRangeTimeLimitIsClampedRatherThanObeyed() throws {
+        // This one bounds a running process, so a hand-edited `0` would cut every review off
+        // before it began and a stray `100000` would pin a reviewer for weeks.
+        let json = #"""
+        {"claude":{"enabled":true,"model":"m","effort":"high","timeoutMinutes":0},
+         "codex":{"enabled":true,"model":"m","effort":"high","timeoutMinutes":100000}}
+        """#
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+        XCTAssertEqual(
+            configuration.claude.timeoutMinutes,
+            ReviewerConfiguration.timeoutMinutesRange.lowerBound
+        )
+        XCTAssertEqual(
+            configuration.codex.timeoutMinutes,
+            ReviewerConfiguration.timeoutMinutesRange.upperBound
+        )
+    }
+
+    func testTheTimeLimitSurvivesARoundTrip() throws {
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.timeoutMinutes = 45
+        let restored = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: JSONEncoder().encode(configuration)
+        )
+        XCTAssertEqual(restored.claude.timeoutMinutes, 45)
+    }
+
+    // MARK: - Reviews that assess nothing
+
+    func testAReviewThatSaysItCouldNotAssessIsRecognisedInTheWordingModelsUse() {
+        let saidSo = [
+            "This PR could not be reviewed: the diff is not readable.",
+            "## Merge gate\nUnable to assess.",
+            "I could not review this pull request without the diff.",
+            "I have no basis to certify the PR as mergeable.",
+            "The gate cannot be meaningfully determined from the evidence available.",
+        ]
+        for body in saidSo {
+            XCTAssertTrue(
+                VerdictParser.statesItCouldNotAssess(body),
+                "should have been recognised: \(body)"
+            )
+        }
+    }
+
+    func testOrdinaryReviewProseIsNotMistakenForAnInabilityToAssess() {
+        // The expensive mistake in the other direction: a real review whose findings happen to
+        // use the same verbs would have its verdict thrown away and the pull request left
+        // unreviewed, which is exactly the outcome this check exists to prevent.
+        let ordinaryReviews = [
+            "## Summary\nThe migration could not be verified against production data, so I flagged it.",
+            "This change could not have caused the regression described in the thread.",
+            "I reviewed the diff and found two blocking issues.",
+            "The author could not reproduce the failure, but the added test covers it.",
+            "## Summary\nLooks safe.",
+        ]
+        for body in ordinaryReviews {
+            XCTAssertFalse(
+                VerdictParser.statesItCouldNotAssess(body),
+                "should NOT have been recognised: \(body)"
+            )
+        }
+    }
+
+    func testAWithdrawnVerdictClassifiesAsTerminalSoItIsNotRetried() {
+        let withdrawn = ReviewerResult(
+            reviewer: .claude,
+            model: "claude-opus-5",
+            output: "",
+            verdict: nil,
+            failure: "reported that it could not assess this pull request, so its verdict was not counted"
+        )
+        XCTAssertTrue(withdrawn.couldNotAssess)
+        XCTAssertEqual(withdrawn.failureClass, .terminal)
+        XCTAssertFalse(withdrawn.isWorthRetrying)
+    }
 }

@@ -449,6 +449,28 @@ private struct ReviewerCard: View {
                 }
                 .disabled(!configuration.enabled)
 
+                HStack {
+                    Text("Time limit")
+                        .frame(width: 70, alignment: .leading)
+                    Stepper(
+                        value: $configuration.timeoutMinutes,
+                        in: ReviewerConfiguration.timeoutMinutesRange
+                    ) {
+                        Text("\(configuration.timeoutMinutes) min")
+                            .font(.body.monospaced())
+                    }
+                }
+                .disabled(!configuration.enabled)
+
+                Text(
+                    "How long \(title) may spend on one review before it is cut off. A review "
+                        + "that runs out of time contributes nothing, so a large pull request may "
+                        + "need more than the default."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
                 if isSmallModel(configuration.model) {
                     Label(
                         "This model is small or experimental: it measurably degrades under adversarial pull-request content, so Review Bot gates its approvals behind injection checks (and never approves when a `VERDICT:` line appears in the thread or diff).",
