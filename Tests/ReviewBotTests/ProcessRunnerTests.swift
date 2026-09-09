@@ -2,6 +2,56 @@ import XCTest
 @testable import ReviewBot
 
 final class ProcessRunnerTests: XCTestCase {
+    func testTimeoutStopsDescendantsEvenWhenTheyIgnoreTermination() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let marker = directory.appendingPathComponent("orphan-finished")
+        let script = #"if (fork() == 0) { $SIG{TERM} = 'IGNORE'; sleep 2; open(my $f, '>', $ARGV[0]) or die $!; print $f 'orphan'; exit 0; } sleep 5;"#
+        do {
+            _ = try await ProcessRunner().run("/usr/bin/perl", arguments: ["-e", script, marker.path], timeout: 1)
+            XCTFail("Expected timeout")
+        } catch let error as CommandExecutionError {
+            guard case .timedOut(_, 1) = error else { return XCTFail("Wrong timeout") }
+        }
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "A timed-out review must not continue in an orphaned child")
+    }
+
+    func testChildCannotDisableTheDeadline() async throws {
+        _ = ProcessRunner.augmentedPath // Exclude one-time login-shell discovery from the deadline.
+        let started = Date()
+        do {
+            _ = try await ProcessRunner().run("/usr/bin/perl", arguments: ["-e", "alarm 0; sleep 3;"], timeout: 1)
+            XCTFail("A child cancelling its own alarm must not cancel the runner deadline")
+        } catch is CommandExecutionError { }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2.5)
+    }
+
+    func testChildSignalIsPreserved() async throws {
+        let result = try await ProcessRunner().run("/usr/bin/perl", arguments: ["-e", "kill 'TERM', $$;"], timeout: 5)
+        XCTAssertEqual(result.exitCode, 15)
+        XCTAssertFalse(result.succeeded)
+    }
+
+    func testNormalExitCodeAndOutputArePreserved() async throws {
+        let result = try await ProcessRunner().run("/usr/bin/perl", arguments: ["-e", "print 'out'; print STDERR 'err'; exit 124;"], timeout: 5)
+        XCTAssertEqual(result.exitCode, 124)
+        XCTAssertEqual(result.stdout, "out")
+        XCTAssertEqual(result.stderr, "err")
+    }
+
+    func testTimeoutDoesNotKillAnotherConcurrentCommand() async throws {
+        async let survivor = ProcessRunner().run("/usr/bin/perl", arguments: ["-e", "sleep 2; print 'survived';"], timeout: 5)
+        do {
+            _ = try await ProcessRunner().run("/usr/bin/perl", arguments: ["-e", "sleep 5;"], timeout: 1)
+            XCTFail("Expected timeout")
+        } catch is CommandExecutionError { }
+        let result = try await survivor
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(result.stdout, "survived")
+    }
+
     private let home = "/Users/tester"
     private let minimalPath = "/usr/bin:/bin:/usr/sbin:/sbin"
 
