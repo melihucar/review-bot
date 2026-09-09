@@ -9,6 +9,11 @@ struct CommandResult {
     var succeeded: Bool { exitCode == 0 }
 }
 
+/// Changes applied on top of the inherited environment. A `nil` value removes the variable,
+/// which is how a reviewer configured for session auth is kept from silently picking up an
+/// API key that happens to be exported in the developer's shell.
+typealias EnvironmentOverrides = [String: String?]
+
 protocol CommandRunning {
     func run(
         _ executable: String,
@@ -17,15 +22,17 @@ protocol CommandRunning {
         timeout: Int
     ) async throws -> CommandResult
 
-    /// Runs a command with extra environment variables merged over the process
-    /// environment. A default implementation is provided in an extension, so
-    /// mocks that only implement the environment-free variant keep working.
+    /// Runs a command with per-command changes applied to the process environment. A `nil`
+    /// value removes the variable (see `EnvironmentOverrides`), which is how a reviewer
+    /// configured for session auth is kept from inheriting an exported API key. A default
+    /// implementation is provided in an extension, so mocks that only implement the
+    /// environment-free variant keep working.
     func run(
         _ executable: String,
         arguments: [String],
         currentDirectory: URL?,
-        timeout: Int,
-        environment: [String: String]?
+        environment: EnvironmentOverrides,
+        timeout: Int
     ) async throws -> CommandResult
 }
 
@@ -43,12 +50,14 @@ extension CommandRunning {
         )
     }
 
+    /// Runners that do not care about the environment (test doubles, mainly) inherit this and
+    /// behave exactly as they did before environment overrides existed.
     func run(
         _ executable: String,
         arguments: [String],
         currentDirectory: URL?,
-        timeout: Int,
-        environment: [String: String]?
+        environment: EnvironmentOverrides,
+        timeout: Int
     ) async throws -> CommandResult {
         try await run(
             executable,
@@ -117,18 +126,26 @@ struct ProcessRunner: CommandRunning {
     ///
     /// `OLDPWD` is dropped rather than corrected: it describes a `cd` this process never made, and
     /// there is no honest value for it here.
+    ///
+    /// Overrides are applied last, so a caller can deliberately override even `PATH` or `PWD`. An
+    /// override whose value is `nil` removes the variable outright, which is what unsets an
+    /// inherited API key for a reviewer running under session auth.
     static func composeEnvironment(
         inherited: [String: String],
         path: String,
         workingDirectory: String,
-        overrides: [String: String]?
+        overrides: EnvironmentOverrides
     ) -> [String: String] {
         var environment = inherited
         environment["PATH"] = path
         environment["PWD"] = workingDirectory
         environment.removeValue(forKey: "OLDPWD")
-        for (key, value) in overrides ?? [:] {
-            environment[key] = value
+        for (key, value) in overrides {
+            if let value {
+                environment[key] = value
+            } else {
+                environment.removeValue(forKey: key)
+            }
         }
         return environment
     }
@@ -204,25 +221,25 @@ struct ProcessRunner: CommandRunning {
             executable,
             arguments: arguments,
             currentDirectory: currentDirectory,
-            timeout: timeout,
-            environment: nil
+            environment: [:],
+            timeout: timeout
         )
     }
 
     func run(
         _ executable: String,
-        arguments: [String] = [],
-        currentDirectory: URL? = nil,
-        timeout: Int = 60,
-        environment: [String: String]?
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: EnvironmentOverrides,
+        timeout: Int
     ) async throws -> CommandResult {
         try await Task.detached(priority: .utility) {
             try runSynchronously(
                 executable,
                 arguments: arguments,
                 currentDirectory: currentDirectory,
-                timeout: timeout,
-                environmentOverrides: environment
+                environment: environment,
+                timeout: timeout
             )
         }.value
     }
@@ -231,8 +248,8 @@ struct ProcessRunner: CommandRunning {
         _ executable: String,
         arguments: [String],
         currentDirectory: URL?,
-        timeout: Int,
-        environmentOverrides: [String: String]? = nil
+        environment overrides: EnvironmentOverrides,
+        timeout: Int
     ) throws -> CommandResult {
         let temporaryDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("review-bot-command-\(UUID().uuidString)", isDirectory: true)
@@ -271,7 +288,7 @@ struct ProcessRunner: CommandRunning {
             // `currentDirectory` is what `process.currentDirectoryURL` was just set to, so the two
             // cannot drift; when it is nil the child inherits this process's own directory.
             workingDirectory: currentDirectory?.path ?? fileManager.currentDirectoryPath,
-            overrides: environmentOverrides
+            overrides: overrides
         )
 
         try process.run()
