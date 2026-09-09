@@ -296,8 +296,8 @@ private struct ReviewersSettingsView: View {
                     stepperTitle: { "Try a review request up to \($0) time\($0 == 1 ? "" : "s")" },
                     caption: { limit in
                         limit == nil
-                            ? "A request whose reviewers keep failing is retried forever, with a widening delay between attempts."
-                            : "A review that doesn't post — a reviewer errored, returned no verdict, or GitHub rejected the post — is retried with a widening delay, then abandoned. A new commit, a re-request, or Run now starts over."
+                            ? "A request whose reviewers keep failing is retried forever, with a widening delay between attempts. Every attempt re-runs the reviewers, so any reviewer billed to your own API key is charged again."
+                            : "A review that doesn't post — a reviewer errored, returned no verdict, or GitHub rejected the post — is retried with a widening delay, then abandoned. Every attempt re-runs the reviewers, so any reviewer billed to your own API key is charged again. A new commit, a re-request, or Run now starts over."
                     },
                     limit: Binding(
                         get: { settings.configuration.failureBudget.limit },
@@ -305,41 +305,39 @@ private struct ReviewersSettingsView: View {
                     )
                 )
 
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle(
+                            "Include token usage and cost in the posted review",
+                            isOn: $settings.configuration.includeUsageInReview
+                        )
+                        Text("Usage is always recorded in the activity history, whether or not it is posted. Only reviewers billed per token appear — a reviewer using its signed-in CLI is covered by that subscription, so no dollar figure is attributed to it.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                } label: {
+                    Label("Usage and cost", systemImage: "chart.bar.doc.horizontal")
+                }
+
                 ToolStatusRow(
                     name: "GitHub CLI",
                     command: "gh",
                     isAvailable: model.toolAvailability["gh"] == true
                 )
 
-                ReviewerCard(
-                    title: "Claude",
-                    icon: "brain.head.profile",
-                    command: "claude",
-                    configuration: $settings.configuration.claude,
-                    efforts: ReviewEffort.claudeCases,
-                    isAvailable: model.toolAvailability["claude"] == true
-                )
-
-                ReviewerCard(
-                    title: "Codex",
-                    icon: "terminal.fill",
-                    command: "codex",
-                    configuration: $settings.configuration.codex,
-                    efforts: ReviewEffort.codexCases,
-                    isAvailable: model.toolAvailability["codex"] == true
-                )
-
-                ReviewerCard(
-                    title: "opencode",
-                    icon: "chevron.left.forwardslash.chevron.right",
-                    command: "opencode",
-                    configuration: $settings.configuration.opencode,
-                    efforts: ReviewEffort.opencodeCases,
-                    isAvailable: model.toolAvailability["opencode"] == true
-                )
+                // One card per reviewer, in `ReviewerName` declaration order — the same order
+                // `enabledReviewers` uses, so the settings list reads like the posted review.
+                ForEach(ReviewerName.allCases) { reviewer in
+                    ReviewerCard(
+                        model: model,
+                        reviewer: reviewer,
+                        configuration: configurationBinding(for: reviewer)
+                    )
+                }
 
                 HStack {
-                    Text("At least one AI reviewer must be enabled. opencode is off by default; it runs the free `opencode/deepseek-v4-flash-free` model at max reasoning effort in a read-only sandbox.")
+                    Text("At least one AI reviewer must be enabled. opencode is off by default; it runs the free `opencode/deepseek-v4-flash-free` model at max reasoning effort in a read-only sandbox. DeepSeek is off by default too — it has no CLI, so it needs an API key saved on its card above before it can review.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -349,6 +347,15 @@ private struct ReviewersSettingsView: View {
                 }
             }
             .padding(.top, 10)
+        }
+    }
+
+    private func configurationBinding(for reviewer: ReviewerName) -> Binding<ReviewerConfiguration> {
+        switch reviewer {
+        case .claude: $settings.configuration.claude
+        case .codex: $settings.configuration.codex
+        case .opencode: $settings.configuration.opencode
+        case .deepseek: $settings.configuration.deepseek
         }
     }
 }
@@ -401,12 +408,9 @@ private struct OptionalLimitBox: View {
 }
 
 private struct ReviewerCard: View {
-    let title: String
-    let icon: String
-    let command: String
+    @ObservedObject var model: AppModel
+    let reviewer: ReviewerName
     @Binding var configuration: ReviewerConfiguration
-    let efforts: [ReviewEffort]
-    let isAvailable: Bool
 
     /// Small/experimental models with measurably weaker resistance to injected
     /// thread content (see the prompt-injection spike in issue #3).
@@ -417,14 +421,50 @@ private struct ReviewerCard: View {
         return Self.smallModelMarkers.contains { name.contains($0) }
     }
 
+    /// The key rows apply whenever the reviewer is actually billed to a saved key — either the
+    /// developer chose that mode, or the reviewer has no session mode to fall back to.
+    private var usesSavedKey: Bool {
+        reviewer.supportsAPIKeyAuth
+            && (configuration.authMode == .apiKey || !reviewer.supportsSessionAuth)
+    }
+
+    /// What the usage report will be able to say about this reviewer. A CLI that prints its own
+    /// envelope reports both figures; DeepSeek's API returns token counts and no price at all, so
+    /// promising a dollar figure for it would be a promise nothing can keep.
+    private var usageNote: String {
+        guard let command = reviewer.commandName else {
+            return "\(reviewer.rawValue)'s API reports the tokens each review consumes, but no "
+                + "price, so its spend appears as a token count with no cost."
+        }
+        return "The \(command) CLI reports its own tokens and cost, so this reviewer's spend "
+            + "appears in the usage report."
+    }
+
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Toggle("Enable \(title)", isOn: $configuration.enabled)
+                    Toggle("Enable \(reviewer.rawValue)", isOn: $configuration.enabled)
                         .font(.headline)
                     Spacer()
-                    ToolAvailabilityBadge(isAvailable: isAvailable, command: command)
+                    if let command = reviewer.commandName {
+                        ToolAvailabilityBadge(
+                            isAvailable: model.isReviewerAvailable(reviewer),
+                            command: command
+                        )
+                    } else if model.isReviewerAvailable(reviewer) {
+                        Label("HTTP API — key saved", systemImage: "network")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        // Same question the badge above asks, answered the way it has to be for a
+                        // reviewer with no binary to probe: a key is the only thing that makes it
+                        // reachable, so saying "no CLI needed" while it cannot run would be a
+                        // green light for a reviewer that is about to fail.
+                        Label("HTTP API — no key saved", systemImage: "network")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
                 }
 
                 HStack {
@@ -436,18 +476,68 @@ private struct ReviewerCard: View {
                 }
                 .disabled(!configuration.enabled)
 
-                HStack {
-                    Text("Effort")
-                        .frame(width: 70, alignment: .leading)
-                    Picker("Effort", selection: $configuration.effort) {
-                        ForEach(efforts) { effort in
-                            Text(effort.label).tag(effort)
+                if reviewer.usesEffortSetting {
+                    HStack {
+                        Text("Effort")
+                            .frame(width: 70, alignment: .leading)
+                        Picker("Effort", selection: $configuration.effort) {
+                            ForEach(reviewer.efforts) { effort in
+                                Text(effort.label).tag(effort)
+                            }
                         }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
+                    .disabled(!configuration.enabled)
                 }
-                .disabled(!configuration.enabled)
+
+                Divider()
+
+                if reviewer.supportsSessionAuth && reviewer.supportsAPIKeyAuth {
+                    HStack {
+                        Text("Sign-in")
+                            .frame(width: 70, alignment: .leading)
+                        Picker("Sign-in", selection: $configuration.authMode) {
+                            ForEach(ReviewerAuthMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                    }
+                    .disabled(!configuration.enabled)
+
+                    Text(configuration.authMode == .session
+                        ? "Uses whatever `\(reviewer.commandName ?? "")` is already logged in as. Review Bot sends no credentials."
+                        : "Runs `\(reviewer.commandName ?? "")` with `\(reviewer.apiKeyEnvironmentVariable ?? "")` set from your Keychain, billing that key instead of the CLI's own login.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if !reviewer.supportsAPIKeyAuth {
+                    // No picker to explain itself, so say where the credentials come from.
+                    Text("Uses whatever `\(reviewer.commandName ?? "")` is already logged in as. It takes no API key from Review Bot — its provider is chosen in its own configuration — so nothing it spends is billed to a key kept here.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if usesSavedKey {
+                    APIKeyRow(model: model, reviewer: reviewer)
+                        .disabled(!configuration.enabled)
+
+                    // A key-mode reviewer is metered, so say up front whether this review will
+                    // be able to report what it cost.
+                    if reviewer.reportsTokenUsage {
+                        Label(usageNote, systemImage: "checkmark.seal")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Label(
+                            "This CLI does not report token usage, so its cost cannot be tracked.",
+                            systemImage: "questionmark.circle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
 
                 if isSmallModel(configuration.model) {
                     Label(
@@ -461,7 +551,57 @@ private struct ReviewerCard: View {
             }
             .padding(8)
         } label: {
-            Label(title, systemImage: icon)
+            Label(reviewer.rawValue, systemImage: reviewer.symbolName)
+        }
+        .onChange(of: configuration.authMode) { _, _ in
+            Task { await model.refreshSavedKeys() }
+        }
+    }
+}
+
+private struct APIKeyRow: View {
+    @ObservedObject var model: AppModel
+    let reviewer: ReviewerName
+    @State private var draft = ""
+
+    private var hasSavedKey: Bool { model.reviewersWithSavedKey.contains(reviewer) }
+
+    private var trimmedDraft: String {
+        draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("API key")
+                    .frame(width: 70, alignment: .leading)
+                SecureField(
+                    hasSavedKey
+                        ? "A key is saved — type a new one to replace it"
+                        : "Paste your \(reviewer.rawValue) API key",
+                    text: $draft
+                )
+                .textFieldStyle(.roundedBorder)
+                Button("Save") {
+                    let key = draft
+                    draft = ""
+                    Task { await model.saveAPIKey(key, for: reviewer) }
+                }
+                .disabled(trimmedDraft.isEmpty)
+                Button("Remove", role: .destructive) {
+                    Task { await model.removeAPIKey(for: reviewer) }
+                }
+                .disabled(!hasSavedKey)
+            }
+
+            Label(
+                hasSavedKey
+                    ? "Saved in your macOS Keychain, never in config.json."
+                    : "No key saved. \(reviewer.rawValue) reviews will fail until you add one.",
+                systemImage: hasSavedKey ? "key.fill" : "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(hasSavedKey ? .green : .orange)
         }
     }
 }
@@ -714,6 +854,12 @@ private struct HistoryRow: View {
                 Text(entry.date, format: .dateTime.month(.abbreviated).day().hour().minute())
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let usage = entry.usage {
+                    Text(usage.costSummary ?? "\(TokenUsage.abbreviated(usage.totalTokens)) tok")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .help("\(usage.tokenSummary) — metered reviewers only")
+                }
                 if let value = entry.pullRequestURL, let url = URL(string: value) {
                     Link("Open PR", destination: url)
                         .font(.caption)

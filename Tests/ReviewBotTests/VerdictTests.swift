@@ -156,6 +156,16 @@ final class VerdictTests: XCTestCase {
             "API Error: 401 {\"type\":\"authentication_error\"}",
             "Not authenticated. Please run `codex login`.",
             "Your credit balance is too low to access the API.",
+            // DeepSeek reaches the engine over HTTP rather than as a CLI, so its own wording for
+            // a rejected key and an empty account has to be recognised too — a full agent loop
+            // is the most expensive thing in the panel to retry for nothing.
+            "DeepSeek returned HTTP 401: Authentication Fails",
+            "DeepSeek returned HTTP 402: Insufficient Balance",
+            // Review Bot's own message when a reviewer is set to API-key auth and no key
+            // resolves, or the Keychain prompt was denied. Only Settings can fix that, so the
+            // whole failure budget would otherwise be spent on a request that cannot start.
+            "DeepSeek is set to API-key auth but its key could not be read — either none is "
+                + "saved, or macOS Keychain access was denied. Check Settings → Reviewers.",
         ]
         for message in terminal {
             XCTAssertEqual(
@@ -184,6 +194,9 @@ final class VerdictTests: XCTestCase {
             // A pull request is allowed to talk about quotas and logins without disarming
             // the retry: the markers describe what a CLI says about itself.
             "reviewed src/billing/quota.rs and src/auth/login.rs",
+            // DeepSeek's own client already retries 5xx before giving up, but a provider outage
+            // is exactly the failure the next poll is likely to get past.
+            "DeepSeek returned HTTP 503: Service Unavailable",
         ]
         for message in transient {
             XCTAssertEqual(
@@ -202,6 +215,27 @@ final class VerdictTests: XCTestCase {
             verdict: nil,
             failure: "timed out after 900s"
         )
+        result.timedOut = true
+        XCTAssertFalse(result.isWorthRetrying)
+    }
+
+    /// The exemption is the `timedOut` flag, not the message. That distinction matters most for
+    /// DeepSeek: it is the one reviewer with no `ProcessRunner` alarm behind it, so its timeout
+    /// arrives as an ordinary-looking provider error and classifies transient like any other
+    /// network failure. Re-running it in place would mean a second full paid agent loop against
+    /// a provider that is still not answering.
+    func testADeepSeekTimeoutIsExemptedByTheFlagRatherThanByItsWording() {
+        let message = ChatCompletionError.timedOut(seconds: 180).localizedDescription
+        XCTAssertEqual(ReviewerFailureClass.classify(message), .transient)
+
+        var result = ReviewerResult(
+            reviewer: .deepseek,
+            model: "deepseek-chat",
+            output: "",
+            verdict: nil,
+            failure: message
+        )
+        XCTAssertTrue(result.isWorthRetrying, "without the flag it looks retryable")
         result.timedOut = true
         XCTAssertFalse(result.isWorthRetrying)
     }

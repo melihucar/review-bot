@@ -10,7 +10,9 @@ enum ReviewEngineError: LocalizedError {
         switch self {
         case let .commandFailed(message): message
         case let .invalidResponse(message): message
-        case .noReviewersEnabled: "Enable Claude, Codex, or opencode before running reviews."
+        // Deliberately not an enumeration of the reviewers: that sentence went stale every time
+        // one was added, and the settings tab lists them anyway.
+        case .noReviewersEnabled: "Enable at least one AI reviewer before running reviews."
         case let .reviewIncomplete(message): message
         }
     }
@@ -22,6 +24,10 @@ actor ReviewEngine {
 
     private let paths: StoragePaths
     private let runner: any CommandRunning
+    /// Only ever read through `ResolvedCredentials.resolve`, which takes the blocking Keychain
+    /// call off this actor's executor. Nothing here may call `apiKey(for:)` directly.
+    private let credentialStore: any CredentialStoring
+    private let chatClient: any ChatCompleting
     private let reviewedState: ReviewedStateStore
     private let lastReviewed: LastReviewedStore
     private let attempts: ReviewAttemptStore
@@ -38,13 +44,21 @@ actor ReviewEngine {
         let reviewKey: String
     }
 
+    /// Every seam has a production default, so the app constructs the engine with `paths` alone
+    /// while tests replace the pieces they need: `runner` for the CLIs and git/gh, `credentials`
+    /// for the Keychain, `chatClient` so a DeepSeek test never reaches the real API, and `now`
+    /// for the retry backoff, which is otherwise untestable in a poll-interval-sized test.
     init(
         paths: StoragePaths,
         runner: any CommandRunning = ProcessRunner(),
+        credentials: any CredentialStoring = KeychainCredentialStore(),
+        chatClient: any ChatCompleting = DeepSeekClient(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.paths = paths
         self.runner = runner
+        credentialStore = credentials
+        self.chatClient = chatClient
         self.now = now
         reviewedState = ReviewedStateStore(paths: paths)
         lastReviewed = LastReviewedStore(paths: paths)
@@ -68,9 +82,10 @@ actor ReviewEngine {
             await onStatus("Add and enable a repository to begin")
             return
         }
-        guard configuration.claude.enabled
-            || configuration.codex.enabled
-            || configuration.opencode.enabled else {
+        // Derived from `ReviewerName.allCases` rather than a chain of `||`, which stops being
+        // exhaustive the moment a reviewer is added: a DeepSeek-only configuration would then be
+        // reported as having no reviewers and never poll at all.
+        guard !configuration.enabledReviewers.isEmpty else {
             await onStatus(ReviewEngineError.noReviewersEnabled.localizedDescription)
             return
         }
@@ -400,6 +415,7 @@ actor ReviewEngine {
         let repository = pendingReview.repository
         var worktreeURL: URL?
         var worktreeAdded = false
+        var spent: TokenUsage?
 
         do {
             await announce("Preparing \(repository.name) #\(pullRequest.number)…")
@@ -442,14 +458,33 @@ actor ReviewEngine {
             )
             await announce("Reviewing \(repository.name) #\(pullRequest.number)…")
 
+            // Resolved once, here, before any reviewer starts — and off this actor. Reading a
+            // Keychain item is a synchronous call that can block on a modal prompt, so doing it
+            // from inside a reviewer's run method would stall its siblings and the poll loop
+            // behind them. One resolution also means at most one prompt per reviewer per
+            // review, and it covers the adjudicator `runReconciliation` may pick below.
+            let credentials = await ResolvedCredentials.resolve(
+                Self.reviewersNeedingKeys(in: configuration),
+                from: credentialStore
+            )
+
             let results = await runReviewers(
                 configuration: configuration,
                 worktree: worktree,
                 repositoryRules: await loadRepositoryReviewRules(
                     repository: repository,
                     baseCommitSHA: metadata.baseRefOid
-                )
+                ),
+                credentials: credentials
             )
+
+            // Whatever has been billed so far, in a variable declared outside the `do` so a
+            // review that spends real money and then fails still records the spend. Assigned
+            // here — above the incomplete-review throw below, not after it — because a panel
+            // where every metered reviewer failed burned tokens on every attempt too, and its
+            // history entry is the only place that spend can ever be recorded. Re-computed once
+            // the adjudicator has run, since reconciliation is a metered call of its own.
+            spent = usageTotal(results: results, adjudication: nil, configuration: configuration)
 
             // Post as long as *someone* finished. A reviewer that failed is named in the posted
             // body rather than suppressing the review: holding the whole panel hostage to one CLI
@@ -483,14 +518,23 @@ actor ReviewEngine {
             let policy = configuration.decisionPolicy
             let strictDecision = DecisionEvaluator.evaluate(results, policy: policy)
             var decision = strictDecision
+            // The adjudication that *decided* the review — nil when reconciliation produced no
+            // verdict, in which case the strictest verdict stands and there is nothing to
+            // disclose in the posted body.
             var adjudication: ReviewerResult?
+            // The adjudication that was *billed*: every reconciliation that ran, verdict or not.
+            // Kept apart from `adjudication` because a call that came back useless was charged
+            // exactly like one that came back decisive.
+            var adjudicationSpend: ReviewerResult?
             if DecisionEvaluator.gateDisagreement(results, policy: policy) {
                 await announce("Reviewers disagreed on \(repository.name) #\(pullRequest.number); reconciling…")
                 let adjudicated = await runReconciliation(
                     results: results,
                     configuration: configuration,
-                    worktree: worktree
+                    worktree: worktree,
+                    credentials: credentials
                 )
+                adjudicationSpend = adjudicated
                 if let verdict = adjudicated.verdict {
                     decision = DecisionEvaluator.decision(for: verdict, policy: policy)
                     adjudication = adjudicated
@@ -499,9 +543,20 @@ actor ReviewEngine {
                         "Reconciliation for \(repository.githubSlug)#\(pullRequest.number) produced no verdict; using strictest (\(strictDecision.title))."
                     )
                 }
+                spent = usageTotal(
+                    results: results,
+                    adjudication: adjudicationSpend,
+                    configuration: configuration
+                )
             }
             var guardReason: InjectionGuard.Reason?
             if decision == .approve {
+                // The guard sees Review Bot's own copies of the thread and the diff, which is
+                // everything a CLI reviewer was handed. It is not everything a reviewer *read*:
+                // DeepSeek opens files itself through `WorktreeTools`, and no reviewer's view of
+                // the repository is bounded by the diff — so a `VERDICT:` line planted in a file
+                // the pull request does not touch is outside this check by construction. The
+                // review contract's untrusted-input section is what covers that case.
                 guardReason = InjectionGuard.flagIfApproveUnsafe(
                     thread: context.thread,
                     diff: context.diff,
@@ -518,7 +573,12 @@ actor ReviewEngine {
                 results: results,
                 decision: decision,
                 adjudication: adjudication,
-                guardReason: guardReason
+                guardReason: guardReason,
+                usageReport: usageReport(
+                    results: results,
+                    adjudication: adjudicationSpend,
+                    configuration: configuration
+                )
             )
             let reviewFile = try saveReview(
                 reviewBody,
@@ -555,16 +615,26 @@ actor ReviewEngine {
             let reconciledNote = adjudication.map {
                 " Reconciled by \($0.reviewer.rawValue) → \($0.verdict?.rawValue ?? "unavailable")."
             } ?? ""
+            // Recorded whether or not the report is posted, so spend stays traceable either way.
+            let total = spent
+            let usageNote = total.map { usage in
+                " \(TokenUsage.abbreviated(usage.totalTokens)) tokens"
+                    + (usage.costSummary.map { ", \($0)" } ?? "")
+                    + "."
+            } ?? ""
             await emit(
                 kind: decision.historyKind,
                 repository: repository,
                 pullRequest: pullRequest,
-                message: "\(decision.title) — \(verdicts).\(reconciledNote)",
+                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(usageNote)",
+                usage: total,
                 onEvent: onEvent
             )
         } catch {
             // Nothing posted, so the dedup key stays unwritten and the next poll retries —
-            // but the attempt is counted, which is what bounds and paces that retry.
+            // but the attempt is counted, which is what bounds and paces that retry. Any tokens
+            // the reviewers already burned are recorded too: a metered panel that finished and
+            // then failed to reach GitHub cost exactly as much as one that posted.
             let failures = attempts.recordFailure(for: pendingReview.reviewKey, at: now())
             let message = error.localizedDescription + " " + RetryPolicy.note(
                 failures: failures,
@@ -582,7 +652,8 @@ actor ReviewEngine {
                     pullRequestNumber: pullRequest.number,
                     pullRequestTitle: pullRequest.title,
                     pullRequestURL: pullRequest.url,
-                    message: message
+                    message: message,
+                    usage: spent
                 )
             )
         }
@@ -972,37 +1043,40 @@ actor ReviewEngine {
     private func runReviewers(
         configuration: ReviewBotConfiguration,
         worktree: URL,
-        repositoryRules: String?
+        repositoryRules: String?,
+        credentials: ResolvedCredentials
     ) async -> [ReviewerResult] {
         let prompt = DefaultPrompt.combined(
             with: configuration.customPrompt,
             repositoryRules: repositoryRules
         )
+        let reviewers = configuration.enabledReviewers
+        guard !reviewers.isEmpty else { return [] }
 
-        // Runs every enabled reviewer in parallel, preserving a deterministic
-        // output order (Claude, Codex, opencode) regardless of completion order.
-        let enabled: [(ReviewerName, ReviewerConfiguration)] = [
-            (.claude, configuration.claude),
-            (.codex, configuration.codex),
-            (.opencode, configuration.opencode),
-        ].filter { $0.1.enabled }
-
-        let order = Dictionary(uniqueKeysWithValues: enabled.enumerated().map { ($0.element.0, $0.offset) })
-        var results = await withTaskGroup(of: ReviewerResult.self) { group in
-            for (name, reviewer) in enabled {
+        // Each reviewer suspends on network or process I/O, so the actor interleaves them and
+        // they genuinely run in parallel. Results are re-ordered afterwards because a task
+        // group yields in completion order, while the posted panel reads in `ReviewerName`
+        // declaration order.
+        return await withTaskGroup(of: (offset: Int, result: ReviewerResult).self) { group in
+            for (offset, reviewer) in reviewers.enumerated() {
                 group.addTask {
-                    await self.runReviewer(
-                        name,
-                        configuration: reviewer,
-                        prompt: prompt,
-                        worktree: worktree
+                    (
+                        offset,
+                        await self.runReviewer(
+                            reviewer,
+                            prompt: prompt,
+                            worktree: worktree,
+                            credentials: credentials
+                        )
                     )
                 }
             }
-            return await group.reduce(into: []) { $0.append($1) }
+            var collected: [(offset: Int, result: ReviewerResult)] = []
+            for await outcome in group {
+                collected.append(outcome)
+            }
+            return collected.sorted { $0.offset < $1.offset }.map(\.result)
         }
-        results.sort { order[$0.reviewer, default: 0] < order[$1.reviewer, default: 0] }
-        return results
     }
 
     /// How many times one reviewer may be run within a single review. The worktree,
@@ -1013,58 +1087,108 @@ actor ReviewEngine {
     private static let reviewerAttemptsPerReview = 2
 
     private func runReviewer(
-        _ name: ReviewerName,
-        configuration: ReviewerConfiguration,
+        _ reviewer: ConfiguredReviewer,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         var result = await runReviewerOnce(
-            name,
-            configuration: configuration,
+            reviewer,
             prompt: prompt,
-            worktree: worktree
+            worktree: worktree,
+            credentials: credentials
         )
         var attempt = 1
         while attempt < Self.reviewerAttemptsPerReview, result.isWorthRetrying {
             await logger.append(
-                "\(name.rawValue) \(result.failure.map { "failed (\($0))" } ?? "returned no verdict"); running it again before giving up on this review."
+                "\(reviewer.name.rawValue) \(result.failure.map { "failed (\($0))" } ?? "returned no verdict"); running it again before giving up on this review."
             )
-            result = await runReviewerOnce(
-                name,
-                configuration: configuration,
+            var retried = await runReviewerOnce(
+                reviewer,
                 prompt: prompt,
-                worktree: worktree
+                worktree: worktree,
+                credentials: credentials
             )
+            // The abandoned attempt was still billed — including, and especially, when it
+            // *failed*, which is the commonest reason to be here at all. Carrying its usage
+            // forward rather than letting the second result replace it is the difference
+            // between reporting what a metered reviewer cost and reporting half of it, so
+            // `failedReviewer` has to keep a failed attempt's usage for this to add up.
+            if let alreadySpent = result.usage {
+                retried.usage = (retried.usage ?? TokenUsage()) + alreadySpent
+            }
+            result = retried
             attempt += 1
         }
         if result.failureClass == .terminal, let failure = result.failure {
             await logger.append(
-                "\(name.rawValue) failed for a reason a second call cannot fix (\(failure)); skipping the in-review retry and reviewing without it."
+                "\(reviewer.name.rawValue) failed for a reason a second call cannot fix (\(failure)); skipping the in-review retry and reviewing without it."
             )
         }
         return result
     }
 
+    /// The one place a reviewer is actually dispatched — the panel's runs and reconciliation's
+    /// alike, which is what lets the credential check live here rather than in each `run…`
+    /// method. It is also the only compile-time guarantee that a newly added `ReviewerName` runs
+    /// at all: `enabledReviewers`, the `poll` guard, `reviewerDescription` and `meteredUsage`
+    /// all count reviewers without invoking them, so a reviewer missing from this switch would
+    /// be announced and awaited but never called.
     private func runReviewerOnce(
-        _ name: ReviewerName,
-        configuration: ReviewerConfiguration,
+        _ reviewer: ConfiguredReviewer,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
-        switch name {
+        let settings = reviewer.configuration
+        // Checked here rather than inside each `run…` method, so a reviewer added later cannot
+        // start without the credential it was configured to use. The message is one
+        // `ReviewerFailureClass.classify` calls terminal, so the retry above does not spend a
+        // second call — nor the review-level failure budget — on something only Settings fixes.
+        if let missing = missingCredential(
+            for: reviewer.name,
+            configuration: settings,
+            credentials: credentials
+        ) {
+            return failedReviewer(reviewer.name, settings, message: missing)
+        }
+        switch reviewer.name {
         case .claude:
-            await runClaude(configuration: configuration, prompt: prompt, worktree: worktree)
+            return await runClaude(
+                configuration: settings,
+                prompt: prompt,
+                worktree: worktree,
+                credentials: credentials
+            )
         case .codex:
-            await runCodex(configuration: configuration, prompt: prompt, worktree: worktree)
+            return await runCodex(
+                configuration: settings,
+                prompt: prompt,
+                worktree: worktree,
+                credentials: credentials
+            )
         case .opencode:
-            await runOpencode(configuration: configuration, prompt: prompt, worktree: worktree)
+            return await runOpencode(
+                configuration: settings,
+                prompt: prompt,
+                worktree: worktree,
+                credentials: credentials
+            )
+        case .deepseek:
+            return await runDeepSeek(
+                configuration: settings,
+                prompt: prompt,
+                worktree: worktree,
+                credentials: credentials
+            )
         }
     }
 
     private func runReconciliation(
         results: [ReviewerResult],
         configuration: ReviewBotConfiguration,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         // Only reviewers that reached a verdict are adjudicated. `results` keeps the ones that
         // failed so the posted body can disclose a partial panel, but a failed reviewer has no
@@ -1083,26 +1207,38 @@ actor ReviewEngine {
             }
         }
         let prompt = DefaultPrompt.reconciliation(reviews: panel)
-        // Reviewers are enabled whenever verdicts disagree; prefer Claude as
-        // adjudicator, then Codex, then opencode.
-        if configuration.claude.enabled {
-            return await runClaude(
-                configuration: configuration.claude,
-                prompt: prompt,
-                worktree: worktree
+
+        // The adjudicator is the first *enabled* CLI reviewer in `ReviewerName` order — Claude,
+        // then Codex, then opencode. Expressed over `enabledReviewers` rather than as an
+        // if-ladder ending in an unconditional `runOpencode`, which would spawn the opencode
+        // process with a disabled configuration whenever neither of the first two was on.
+        // DeepSeek is deliberately not a candidate: it is the reviewer that always bills a key,
+        // and giving the last word to an extra metered pass is the wrong default. With none of
+        // the three enabled there is nobody to ask, and the caller keeps the strictest verdict.
+        let enabled = configuration.enabledReviewers
+        let preference: [ReviewerName] = [.claude, .codex, .opencode]
+        guard let adjudicator = preference
+            .lazy
+            .compactMap({ name in enabled.first { $0.name == name } })
+            .first
+        else {
+            return failedReviewer(
+                .claude,
+                configuration.claude,
+                message: "No reviewer was available to reconcile the disagreement."
             )
         }
-        if configuration.codex.enabled {
-            return await runCodex(
-                configuration: configuration.codex,
-                prompt: prompt,
-                worktree: worktree
-            )
-        }
-        return await runOpencode(
-            configuration: configuration.opencode,
+        // Dispatching through `runReviewerOnce` rather than reaching for a `run…` method
+        // directly is what keeps the credential check in one place: an adjudicator must not
+        // start under a login it was not configured to use either. Deliberately
+        // `runReviewerOnce` and not `runReviewer`: adjudication is one extra pass over work that
+        // is already done, and for a metered adjudicator a silent second attempt is a second
+        // bill for an answer the panel can live without.
+        return await runReviewerOnce(
+            adjudicator,
             prompt: prompt,
-            worktree: worktree
+            worktree: worktree,
+            credentials: credentials
         )
     }
 
@@ -1124,10 +1260,63 @@ actor ReviewEngine {
         return rules.isEmpty ? nil : rules
     }
 
+    /// The reviewers this review may have to hand a key to. Reconciliation picks its adjudicator
+    /// from the enabled reviewers too, so one resolution covers the panel and the adjudicator
+    /// both. A reviewer left on session auth is not asked about at all: reading a Keychain item
+    /// can raise a modal prompt, and someone who chose the signed-in CLIs should never see one.
+    private static func reviewersNeedingKeys(
+        in configuration: ReviewBotConfiguration
+    ) -> [ReviewerName] {
+        ReviewerName.allCases.filter { reviewer in
+            let settings = configuration.settings(for: reviewer)
+            return settings.enabled && reviewer.supportsAPIKeyAuth && settings.authMode == .apiKey
+        }
+    }
+
+    /// The environment a CLI reviewer runs with. In `.apiKey` mode the resolved key is injected;
+    /// in `.session` mode the variable is explicitly removed, so the CLI uses its own login even
+    /// when a key is exported in the developer's shell. A reviewer with no key variable at all —
+    /// opencode, which is credentialed through its own config directory — gets no changes, which
+    /// is why it needs `OPENCODE_CONFIG_DIR`/`OPENCODE_CONFIG_CONTENT` merged in on top.
+    private func environmentOverrides(
+        for reviewer: ReviewerName,
+        configuration: ReviewerConfiguration,
+        credentials: ResolvedCredentials
+    ) -> EnvironmentOverrides {
+        guard let variable = reviewer.apiKeyEnvironmentVariable else { return [:] }
+        guard configuration.authMode == .apiKey else { return [variable: nil] }
+        return [variable: credentials.apiKey(for: reviewer)]
+    }
+
+    /// `nil` when the reviewer is ready to run, or a message explaining what is missing.
+    ///
+    /// Checked in `runReviewerOnce`, which both the panel and `runReconciliation` dispatch
+    /// through — an adjudicator must not start under a login it was not configured to use
+    /// either. The message is one `ReviewerFailureClass.classify` calls terminal, so the
+    /// in-review retry does not spend a second call — nor the review-level failure budget — on
+    /// something only Settings can fix.
+    private func missingCredential(
+        for reviewer: ReviewerName,
+        configuration: ReviewerConfiguration,
+        credentials: ResolvedCredentials
+    ) -> String? {
+        // A reviewer Review Bot cannot hand a key to can never be missing one, whatever mode a
+        // hand-edited or migrated `config.json` claims it is in.
+        guard reviewer.supportsAPIKeyAuth else { return nil }
+        guard configuration.authMode == .apiKey else { return nil }
+        guard credentials.apiKey(for: reviewer) == nil else { return nil }
+        // A denied Keychain prompt is indistinguishable from an absent item here, and denial is
+        // easy to hit because each rebuild re-signs the app and re-triggers the prompt.
+        return "\(reviewer.rawValue) is set to API-key auth but its key could not be read — "
+            + "either none is saved, or macOS Keychain access was denied. "
+            + "Check Settings → Reviewers, or switch it back to the signed-in CLI."
+    }
+
     private func runClaude(
         configuration: ReviewerConfiguration,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         do {
             let result = try await runner.run(
@@ -1137,30 +1326,136 @@ actor ReviewEngine {
                     "--model", configuration.model,
                     "--effort", configuration.effort.rawValue,
                     "--allowedTools", "Read", "Grep", "Glob",
-                    "--output-format", "text",
+                    // JSON rather than text so the CLI's own token counts and dollar cost come
+                    // back with the review. Parsed defensively — see `claudeOutput`.
+                    "--output-format", "json",
                 ],
                 currentDirectory: worktree,
+                environment: environmentOverrides(
+                    for: .claude,
+                    configuration: configuration,
+                    credentials: credentials
+                ),
                 timeout: 900
             )
+            let parsed = claudeOutput(result.stdout)
             guard result.succeeded else {
-                return failedReviewer(.claude, configuration, message: conciseError(result))
+                // A failing CLI that still emitted the envelope explains itself in `result`;
+                // raw JSON in the history would not.
+                let explanation = parsed.parsedEnvelope
+                    ? parsed.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    : ""
+                return failedReviewer(
+                    .claude,
+                    configuration,
+                    message: explanation.isEmpty
+                        ? conciseError(result)
+                        : String(explanation.prefix(600)),
+                    // Billed all the same, and this is the branch the retry usually comes from.
+                    usage: parsed.usage
+                )
+            }
+            if let failure = parsed.failure {
+                return failedReviewer(
+                    .claude,
+                    configuration,
+                    message: failure,
+                    usage: parsed.usage
+                )
             }
             return ReviewerResult(
                 reviewer: .claude,
                 model: configuration.model,
-                output: result.stdout,
-                verdict: VerdictParser.parse(result.stdout),
-                failure: nil
+                output: parsed.text,
+                verdict: VerdictParser.parse(parsed.text),
+                failure: nil,
+                usage: parsed.usage
             )
         } catch {
             return failedReviewer(.claude, configuration, error: error)
         }
     }
 
+    private struct CLIReviewOutput {
+        let text: String
+        let usage: TokenUsage?
+        let failure: String?
+        /// False when stdout was not the JSON envelope, so callers know `text` is raw output.
+        let parsedEnvelope: Bool
+    }
+
+    /// Reads Claude's `--output-format json` envelope.
+    ///
+    /// Falls back to treating stdout as the review verbatim when it is not that envelope, so a
+    /// CLI that accepts the flag but prints something else — or a mocked runner in the tests —
+    /// behaves exactly as it did before. That is a parsing fallback, not a compatibility probe:
+    /// `--output-format json` is passed unconditionally, so a `claude` old enough to *reject*
+    /// the flag exits non-zero and the reviewer fails rather than being re-run as text — there
+    /// is no capability probe, and a probing re-run would spend a second billed call on every
+    /// review to guard against a CLI nobody has reported. Cost comes straight from the CLI,
+    /// which is the only place a dollar figure is reported at all — DeepSeek's API returns
+    /// tokens and no price — so there is no price table to keep current.
+    private func claudeOutput(_ stdout: String) -> CLIReviewOutput {
+        guard let envelope = try? JSONDecoder().decode(
+            ClaudeResultEnvelope.self,
+            from: Data(stdout.utf8)
+        ), let result = envelope.result else {
+            return CLIReviewOutput(text: stdout, usage: nil, failure: nil, parsedEnvelope: false)
+        }
+
+        let usage = TokenUsage(
+            // Cache *writes* are fresh input tokens that happen to have been stored; only reads
+            // were served from cache.
+            inputTokens: (envelope.usage?.inputTokens ?? 0)
+                + (envelope.usage?.cacheCreationInputTokens ?? 0),
+            cachedInputTokens: envelope.usage?.cacheReadInputTokens ?? 0,
+            outputTokens: envelope.usage?.outputTokens ?? 0,
+            requests: 1,
+            costUSD: envelope.totalCostUSD
+        )
+        return CLIReviewOutput(
+            text: result,
+            usage: usage,
+            failure: envelope.isError == true
+                ? String(result.trimmingCharacters(in: .whitespacesAndNewlines).prefix(600))
+                : nil,
+            parsedEnvelope: true
+        )
+    }
+
+    private struct ClaudeResultEnvelope: Decodable {
+        struct Usage: Decodable {
+            let inputTokens: Int?
+            let outputTokens: Int?
+            let cacheReadInputTokens: Int?
+            let cacheCreationInputTokens: Int?
+
+            private enum CodingKeys: String, CodingKey {
+                case inputTokens = "input_tokens"
+                case outputTokens = "output_tokens"
+                case cacheReadInputTokens = "cache_read_input_tokens"
+                case cacheCreationInputTokens = "cache_creation_input_tokens"
+            }
+        }
+
+        let result: String?
+        let isError: Bool?
+        let totalCostUSD: Double?
+        let usage: Usage?
+
+        private enum CodingKeys: String, CodingKey {
+            case result
+            case isError = "is_error"
+            case totalCostUSD = "total_cost_usd"
+            case usage
+        }
+    }
+
     private func runCodex(
         configuration: ReviewerConfiguration,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         let outputFile = worktree.appendingPathComponent(".review-bot-codex.md")
         do {
@@ -1176,6 +1471,11 @@ actor ReviewEngine {
                     prompt,
                 ],
                 currentDirectory: worktree,
+                environment: environmentOverrides(
+                    for: .codex,
+                    configuration: configuration,
+                    credentials: credentials
+                ),
                 timeout: 900
             )
             guard result.succeeded,
@@ -1197,7 +1497,8 @@ actor ReviewEngine {
     private func runOpencode(
         configuration: ReviewerConfiguration,
         prompt: String,
-        worktree: URL
+        worktree: URL,
+        credentials: ResolvedCredentials
     ) async -> ReviewerResult {
         // The opencode reviewer runs as a dedicated read-only agent defined in
         // Review Bot's own data directory (never inside the worktree, so a pull
@@ -1212,6 +1513,21 @@ actor ReviewEngine {
             )
         }
         let permissions = #"{"permission":{"*":"deny","read":"allow","grep":"allow","glob":"allow"}}"#
+        // opencode reads no API key of its own, so `environmentOverrides` contributes nothing
+        // here today. It is still the base of the merge rather than a hardcoded pair, so
+        // opencode stays the same shape as every other CLI reviewer if that ever changes; the
+        // sandbox variables win any collision, since they are what makes the run read-only.
+        let environment = environmentOverrides(
+            for: .opencode,
+            configuration: configuration,
+            credentials: credentials
+        )
+            .merging(
+                [
+                    "OPENCODE_CONFIG_DIR": paths.opencodeConfigDirectory.path,
+                    "OPENCODE_CONFIG_CONTENT": permissions,
+                ]
+            ) { _, sandbox in sandbox }
         do {
             let result = try await runner.run(
                 "opencode",
@@ -1224,11 +1540,8 @@ actor ReviewEngine {
                     prompt,
                 ],
                 currentDirectory: worktree,
-                timeout: 900,
-                environment: [
-                    "OPENCODE_CONFIG_DIR": paths.opencodeConfigDirectory.path,
-                    "OPENCODE_CONFIG_CONTENT": permissions,
-                ]
+                environment: environment,
+                timeout: 900
             )
             guard result.succeeded else {
                 return failedReviewer(.opencode, configuration, message: conciseError(result))
@@ -1273,29 +1586,163 @@ actor ReviewEngine {
         }
     }
 
+    /// How much longer than its own budget the engine gives a DeepSeek review before cancelling
+    /// it outright.
+    ///
+    /// The two bounds do different jobs and must never be equal. `DeepSeekReviewer`'s budget is
+    /// the one meant to fire: reaching it ends the loop by *asking for the review*, so a dozen
+    /// paid rounds of reading are still written up. But it is checked at the top of a round and
+    /// then needs one more request to land, so a hard stop set to exactly the same duration wins
+    /// every time — turning every graceful exit into a cancelled review that posts nothing.
+    /// This margin is the room that closing request needs. It covers the ordinary case — one
+    /// request, which `DeepSeekClient` bounds at 180s — with enough left over for a single
+    /// backoff retry, and deliberately not for all three attempts the client will make against a
+    /// provider that keeps answering 429: a closing request still retrying nine minutes in is not
+    /// going to land, and cancelling it is right. The CLI reviewers need no equivalent because their bound is
+    /// `ProcessRunner`'s `perl alarm`, and a CLI has no graceful exit to protect.
+    private static let deepSeekClosingRequestMargin: TimeInterval = 300
+
+    /// The engine's hard stop on a whole DeepSeek review. Derived from the reviewer's own budget
+    /// rather than restated, so the two cannot drift back into a tie.
+    private static var deepSeekReviewSeconds: Int {
+        Int(DeepSeekReviewer.defaultReviewSeconds + deepSeekClosingRequestMargin)
+    }
+
+    private func runDeepSeek(
+        configuration: ReviewerConfiguration,
+        prompt: String,
+        worktree: URL,
+        credentials: ResolvedCredentials
+    ) async -> ReviewerResult {
+        guard let apiKey = credentials.apiKey(for: .deepseek) else {
+            return failedReviewer(
+                .deepseek,
+                configuration,
+                message: missingCredential(
+                    for: .deepseek,
+                    configuration: configuration,
+                    credentials: credentials
+                ) ?? "No DeepSeek API key is saved."
+            )
+        }
+        let client = chatClient
+        let model = configuration.model
+        // Held by the engine rather than the loop, because a cancelled loop returns nothing at
+        // all: this is the only way the rounds it had already paid for are still counted.
+        let meter = DeepSeekReviewer.SpendMeter()
+        do {
+            // A sleeping task rather than a deadline handed to the reviewer, because this is
+            // the *hard* stop: the loop is cancelled where it suspends, with no chance to
+            // write anything up. The soft stop — the one that ends the loop by asking for the
+            // review — is the reviewer's own, and the margin above is what lets it win.
+            let generated = try await withThrowingTaskGroup(
+                of: DeepSeekReviewer.Generated?.self
+            ) { group -> DeepSeekReviewer.Generated? in
+                group.addTask {
+                    try await DeepSeekReviewer(client: client, model: model)
+                        .review(
+                            prompt: prompt,
+                            worktree: worktree,
+                            apiKey: apiKey,
+                            meter: meter
+                        )
+                }
+                group.addTask {
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(Self.deepSeekReviewSeconds) * 1_000_000_000
+                    )
+                    return nil
+                }
+                let first = try await group.next() ?? nil
+                group.cancelAll()
+                return first
+            }
+            guard let generated else {
+                // Flagged as a timeout by hand: `isWorthRetrying` reads that flag, and without
+                // it the in-review retry answers a hung agent loop with a second one — a full
+                // paid review's worth of rounds for an answer that is unlikely to arrive. The
+                // meter is what keeps those abandoned rounds on the bill.
+                return failedReviewer(
+                    .deepseek,
+                    configuration,
+                    message: "DeepSeek did not finish within \(Self.deepSeekReviewSeconds) seconds.",
+                    timedOut: true,
+                    usage: await meter.total()
+                )
+            }
+            return ReviewerResult(
+                reviewer: .deepseek,
+                model: configuration.model,
+                output: generated.text,
+                verdict: VerdictParser.parse(generated.text),
+                failure: nil,
+                usage: generated.usage
+            )
+        } catch {
+            // Through the shared classifier rather than straight to `message:`, so a provider
+            // timeout is recorded as a timeout here exactly as a `perl alarm` is for the CLIs.
+            return failedReviewer(
+                .deepseek,
+                configuration,
+                error: error,
+                usage: await meter.total()
+            )
+        }
+    }
+
+    /// Classifies a thrown reviewer failure — in particular, whether it was a timeout, which
+    /// `ReviewerResult.isWorthRetrying` reads to keep the in-review retry from answering a hung
+    /// reviewer with a second full paid run.
+    ///
+    /// The unwrap comes first because a DeepSeek loop that had already been billed wraps
+    /// whatever it caught in `PartialSpendFailure`, and that wrapper would otherwise hide the
+    /// timeout inside it from every check below. `usage` overrides the wrapper's own figure
+    /// where the caller has a better one — `runDeepSeek`'s meter, which also sees the rounds a
+    /// cancelled loop paid for — and falls back to it otherwise.
     private func failedReviewer(
         _ reviewer: ReviewerName,
         _ configuration: ReviewerConfiguration,
-        error: Error
+        error: Error,
+        usage: TokenUsage? = nil
     ) -> ReviewerResult {
+        let (underlying, spent) = DeepSeekReviewer.outcome(of: error)
         var timedOut = false
-        if let commandError = error as? CommandExecutionError,
+        if let commandError = underlying as? CommandExecutionError,
            case .timedOut = commandError {
+            timedOut = true
+        } else if let urlError = underlying as? URLError, urlError.code == .timedOut {
+            // The HTTP reviewers have no child process to alarm, so their equivalent of a
+            // hung CLI arrives as a URLSession failure. Classifying it here keeps the "a
+            // timeout is not retried in place" rule reviewer-agnostic.
+            timedOut = true
+        } else if let chatError = underlying as? ChatCompletionError,
+                  case .timedOut = chatError {
+            // `DeepSeekClient` converts the URLSession timeout above into this before it can
+            // reach here, so this — not the `URLError` arm — is the case an HTTP reviewer's
+            // timeout actually takes.
             timedOut = true
         }
         return failedReviewer(
             reviewer,
             configuration,
-            message: error.localizedDescription,
-            timedOut: timedOut
+            message: underlying.localizedDescription,
+            timedOut: timedOut,
+            usage: usage ?? spent
         )
     }
 
+    /// A failure that still reports what it consumed must carry it. A provider bills a call that
+    /// errored exactly like one that succeeded, and a failure is the *dominant* trigger for the
+    /// in-review retry (`ReviewerResult.isWorthRetrying`), so dropping the usage here would
+    /// under-report the retried review — the one case this feature exists to get right.
+    /// `usage` stays `nil` where there is genuinely nothing to report: a command that threw
+    /// before producing output, a timeout, a missing key caught before the CLI ever ran.
     private func failedReviewer(
         _ reviewer: ReviewerName,
         _ configuration: ReviewerConfiguration,
         message: String,
-        timedOut: Bool = false
+        timedOut: Bool = false,
+        usage: TokenUsage? = nil
     ) -> ReviewerResult {
         ReviewerResult(
             reviewer: reviewer,
@@ -1303,8 +1750,93 @@ actor ReviewEngine {
             output: "_\(reviewer.rawValue) review failed: \(message)_",
             verdict: nil,
             failure: message,
-            timedOut: timedOut
+            timedOut: timedOut,
+            usage: usage
         )
+    }
+
+    /// Everything the developer is billed per token for, across the reviewers and the adjudicator.
+    ///
+    /// A result is counted on its `usage`, not on whether it succeeded — a reviewer whose call
+    /// errored, and an adjudicator that came back without a verdict, were both billed.
+    /// Session-auth CLI reviewers are deliberately excluded: their cost is a flat subscription, so
+    /// attributing dollars to one review would be fiction. Always computed, regardless of whether
+    /// the report is posted, so history and the logs can total spend either way.
+    private func meteredUsage(
+        results: [ReviewerResult],
+        adjudication: ReviewerResult?,
+        configuration: ReviewBotConfiguration
+    ) -> [(reviewer: ReviewerName, model: String, usage: TokenUsage, isAdjudicator: Bool)] {
+        let entries = results.map { ($0, false) } + (adjudication.map { [($0, true)] } ?? [])
+        return entries.compactMap { result, isAdjudicator in
+            guard configuration.settings(for: result.reviewer).authMode == .apiKey,
+                  let usage = result.usage else {
+                return nil
+            }
+            return (result.reviewer, result.model, usage, isAdjudicator)
+        }
+    }
+
+    private func usageTotal(
+        results: [ReviewerResult],
+        adjudication: ReviewerResult?,
+        configuration: ReviewBotConfiguration
+    ) -> TokenUsage? {
+        let metered = meteredUsage(
+            results: results,
+            adjudication: adjudication,
+            configuration: configuration
+        )
+        guard !metered.isEmpty else { return nil }
+        return metered.map(\.usage).reduce(TokenUsage(), +)
+    }
+
+    /// The usage section appended to the posted review, or `nil` when it is switched off or there
+    /// is nothing metered to report.
+    private func usageReport(
+        results: [ReviewerResult],
+        adjudication: ReviewerResult?,
+        configuration: ReviewBotConfiguration
+    ) -> String? {
+        guard configuration.includeUsageInReview else { return nil }
+        let metered = meteredUsage(
+            results: results,
+            adjudication: adjudication,
+            configuration: configuration
+        )
+        guard !metered.isEmpty,
+              let total = usageTotal(
+                  results: results,
+                  adjudication: adjudication,
+                  configuration: configuration
+              ) else {
+            return nil
+        }
+
+        let rows = metered.map { entry in
+            let label = entry.isAdjudicator
+                ? "\(entry.reviewer.rawValue) (reconciliation)"
+                : entry.reviewer.rawValue
+            let cost = entry.usage.costSummary ?? "not reported"
+            return "| \(label) | `\(entry.model)` | \(entry.usage.tokenSummary) | \(cost) |"
+        }.joined(separator: "\n")
+
+        let totalCost = total.costSummary.map { " — **\($0)**" } ?? ""
+        return """
+
+
+        <details><summary><strong>Token usage and cost\(totalCost)</strong></summary>
+
+        | Reviewer | Model | Tokens | Cost |
+        | --- | --- | --- | --- |
+        \(rows)
+
+        \(TokenUsage.abbreviated(total.totalTokens)) tokens in total, as reported by the \
+        reviewers themselves. Only reviewers billed per token are listed; reviewers using a \
+        signed-in CLI are covered by its subscription.
+
+        </details>
+        """
     }
 
     private func aggregateReview(
@@ -1313,7 +1845,8 @@ actor ReviewEngine {
         results: [ReviewerResult],
         decision: ReviewDecision,
         adjudication: ReviewerResult?,
-        guardReason: InjectionGuard.Reason?
+        guardReason: InjectionGuard.Reason?,
+        usageReport: String?
     ) -> String {
         let verdictSummary = results.map {
             "\($0.reviewer.rawValue): `\($0.verdict?.rawValue ?? "unavailable")`"
@@ -1401,7 +1934,7 @@ actor ReviewEngine {
 
         Independent reviews of `\(commitSHA.prefix(8))` (\(verdictSummary)). These findings are advisory; verify them before acting.
 
-        \(details)
+        \(details)\(usageReport ?? "")
 
         ---
         <sub>Generated locally by Review Bot.</sub>
@@ -1432,6 +1965,7 @@ actor ReviewEngine {
         repository: RepositoryConfiguration,
         pullRequest: PullRequestSummary,
         message: String,
+        usage: TokenUsage? = nil,
         onEvent: @escaping EventSink
     ) async {
         let entry = HistoryEntry(
@@ -1441,7 +1975,8 @@ actor ReviewEngine {
             pullRequestNumber: pullRequest.number,
             pullRequestTitle: pullRequest.title,
             pullRequestURL: pullRequest.url,
-            message: message
+            message: message,
+            usage: usage
         )
         await logger.append(
             "\(kind.label): \(repository.githubSlug)#\(pullRequest.number) — \(message)"
@@ -1450,17 +1985,17 @@ actor ReviewEngine {
     }
 
     private func reviewerDescription(_ configuration: ReviewBotConfiguration) -> String {
-        var reviewers: [String] = []
-        if configuration.claude.enabled {
-            reviewers.append("Claude (\(configuration.claude.effort.label))")
+        let reviewers = configuration.enabledReviewers.map { reviewer in
+            let detail = reviewer.name.usesEffortSetting
+                ? reviewer.configuration.effort.label
+                : reviewer.configuration.model
+            return "\(reviewer.name.rawValue) (\(detail))"
         }
-        if configuration.codex.enabled {
-            reviewers.append("Codex (\(configuration.codex.effort.label))")
-        }
-        if configuration.opencode.enabled {
-            reviewers.append("opencode (\(configuration.opencode.effort.label))")
-        }
-        return "Running " + reviewers.joined(separator: " and ") + "."
+        // Assembled from `enabledReviewers` rather than a branch per reviewer, which read
+        // "A and B and C" once there were three of them — and needed editing for a fourth.
+        guard let last = reviewers.last else { return "Running no reviewers." }
+        guard reviewers.count > 1 else { return "Running \(last)." }
+        return "Running " + reviewers.dropLast().joined(separator: ", ") + " and \(last)."
     }
 
     private func captureCommand(

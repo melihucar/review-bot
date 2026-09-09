@@ -78,7 +78,7 @@ final class ProcessRunnerTests: XCTestCase {
             ],
             path: "/opt/homebrew/bin:\(minimalPath)",
             workingDirectory: "/var/reviewbot/worktrees/acme-widget/pr-42",
-            overrides: nil
+            overrides: [:]
         )
 
         XCTAssertEqual(composed["PWD"], "/var/reviewbot/worktrees/acme-widget/pr-42")
@@ -103,5 +103,27 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertEqual(composed["OPENCODE_CONFIG_DIR"], "/fresh")
         XCTAssertEqual(composed["OPENCODE_CONFIG_CONTENT"], #"{"permission":{"*":"deny"}}"#)
         XCTAssertEqual(composed["PWD"], "/work")
+    }
+
+    func testComposeEnvironmentRemovesVariablesWhoseOverrideIsNil() {
+        // A reviewer configured for session auth must not inherit an API key the developer happens
+        // to export in their shell: the CLI would silently bill that key instead of using the login
+        // it was configured to use, with nothing in the output to say so. Merge semantics cannot
+        // express that, which is why an override value is optional and `nil` means "unset".
+        let composed = ProcessRunner.composeEnvironment(
+            inherited: [
+                "PATH": minimalPath,
+                "ANTHROPIC_API_KEY": "sk-inherited-from-the-shell",
+                "HOME": home,
+            ],
+            path: minimalPath,
+            workingDirectory: "/work",
+            overrides: ["ANTHROPIC_API_KEY": nil]
+        )
+
+        XCTAssertNil(composed["ANTHROPIC_API_KEY"])
+        // Removing one variable leaves the rest of the inherited environment alone.
+        XCTAssertEqual(composed["HOME"], home)
+        XCTAssertEqual(composed["PATH"], minimalPath)
     }
 }
