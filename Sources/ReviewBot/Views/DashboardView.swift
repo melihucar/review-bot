@@ -312,7 +312,8 @@ private struct ReviewersSettingsView: View {
                 )
 
                 ReviewerCard(
-                    title: "Claude",
+                    model: model,
+                    reviewer: .claude,
                     icon: "brain.head.profile",
                     command: "claude",
                     configuration: $settings.configuration.claude,
@@ -321,7 +322,8 @@ private struct ReviewersSettingsView: View {
                 )
 
                 ReviewerCard(
-                    title: "Codex",
+                    model: model,
+                    reviewer: .codex,
                     icon: "terminal.fill",
                     command: "codex",
                     configuration: $settings.configuration.codex,
@@ -330,7 +332,8 @@ private struct ReviewersSettingsView: View {
                 )
 
                 ReviewerCard(
-                    title: "opencode",
+                    model: model,
+                    reviewer: .opencode,
                     icon: "chevron.left.forwardslash.chevron.right",
                     command: "opencode",
                     configuration: $settings.configuration.opencode,
@@ -401,7 +404,8 @@ private struct OptionalLimitBox: View {
 }
 
 private struct ReviewerCard: View {
-    let title: String
+    @ObservedObject var model: AppModel
+    let reviewer: ReviewerName
     let icon: String
     let command: String
     @Binding var configuration: ReviewerConfiguration
@@ -421,7 +425,7 @@ private struct ReviewerCard: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Toggle("Enable \(title)", isOn: $configuration.enabled)
+                    Toggle("Enable \(reviewer.rawValue)", isOn: $configuration.enabled)
                         .font(.headline)
                     Spacer()
                     ToolAvailabilityBadge(isAvailable: isAvailable, command: command)
@@ -449,6 +453,42 @@ private struct ReviewerCard: View {
                 }
                 .disabled(!configuration.enabled)
 
+                Divider()
+
+                // Both modes have to be reachable for a picker to mean anything: a CLI to borrow
+                // a login from, and a variable to deliver a key through. opencode has the first
+                // and not the second, so it falls to the explanation below.
+                if reviewer.supportsSessionAuth, let keyVariable = reviewer.apiKeyEnvironmentVariable {
+                    HStack {
+                        Text("Sign-in")
+                            .frame(width: 70, alignment: .leading)
+                        Picker("Sign-in", selection: $configuration.authMode) {
+                            ForEach(ReviewerAuthMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                    }
+                    .disabled(!configuration.enabled)
+
+                    Text(configuration.authMode == .session
+                        ? "Uses whatever `\(command)` is already logged in as. Review Bot sends no credentials."
+                        : "Runs `\(command)` with `\(keyVariable)` set from your Keychain, billing that key instead of the CLI's own login.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if configuration.authMode == .apiKey {
+                        APIKeyRow(model: model, reviewer: reviewer)
+                            .disabled(!configuration.enabled)
+                    }
+                } else {
+                    // No picker to explain itself, so say where the credentials come from.
+                    Text("Uses whatever `\(command)` is already logged in as. It takes no API key from Review Bot — its provider is chosen in its own configuration — so nothing it spends is billed to a key kept here.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 if isSmallModel(configuration.model) {
                     Label(
                         "This model is small or experimental: it measurably degrades under adversarial pull-request content, so Review Bot gates its approvals behind injection checks (and never approves when a `VERDICT:` line appears in the thread or diff).",
@@ -461,7 +501,57 @@ private struct ReviewerCard: View {
             }
             .padding(8)
         } label: {
-            Label(title, systemImage: icon)
+            Label(reviewer.rawValue, systemImage: icon)
+        }
+        .onChange(of: configuration.authMode) { _, _ in
+            Task { await model.refreshSavedKeys() }
+        }
+    }
+}
+
+private struct APIKeyRow: View {
+    @ObservedObject var model: AppModel
+    let reviewer: ReviewerName
+    @State private var draft = ""
+
+    private var hasSavedKey: Bool { model.reviewersWithSavedKey.contains(reviewer) }
+
+    private var trimmedDraft: String {
+        draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("API key")
+                    .frame(width: 70, alignment: .leading)
+                SecureField(
+                    hasSavedKey
+                        ? "A key is saved — type a new one to replace it"
+                        : "Paste your \(reviewer.rawValue) API key",
+                    text: $draft
+                )
+                .textFieldStyle(.roundedBorder)
+                Button("Save") {
+                    let key = draft
+                    draft = ""
+                    Task { await model.saveAPIKey(key, for: reviewer) }
+                }
+                .disabled(trimmedDraft.isEmpty)
+                Button("Remove", role: .destructive) {
+                    Task { await model.removeAPIKey(for: reviewer) }
+                }
+                .disabled(!hasSavedKey)
+            }
+
+            Label(
+                hasSavedKey
+                    ? "Saved in your macOS Keychain, never in config.json."
+                    : "No key saved. \(reviewer.rawValue) reviews will fail until you add one.",
+                systemImage: hasSavedKey ? "key.fill" : "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(hasSavedKey ? .green : .orange)
         }
     }
 }

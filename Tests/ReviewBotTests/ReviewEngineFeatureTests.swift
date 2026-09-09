@@ -553,6 +553,165 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(usedGhDiff, "First review of a PR should use the full PR diff")
     }
 
+    // MARK: - Per-reviewer credentials
+
+    func testAPIKeyAuthInjectsTheSavedKeyIntoTheReviewerProcess() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant-test"])
+        )
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let environment = await runner.claudeEnvironment()
+        XCTAssertEqual(environment["ANTHROPIC_API_KEY"] ?? nil, "sk-ant-test")
+    }
+
+    func testSessionAuthClearsAnInheritedAPIKey() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant-test"])
+        )
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        // Session auth must not leak a saved key, and must also unset one exported in the
+        // developer's shell so the CLI genuinely uses its own login. The variable being present
+        // with a `nil` value is the removal instruction — an absent key would leave whatever the
+        // app inherited in place.
+        let environment = await runner.claudeEnvironment()
+        XCTAssertTrue(environment.keys.contains("ANTHROPIC_API_KEY"))
+        XCTAssertNil(environment["ANTHROPIC_API_KEY"] ?? nil)
+    }
+
+    /// opencode is the one reviewer with no key variable of its own, so `environmentOverrides`
+    /// contributes nothing for it and its read-only sandbox is merged in on top. That merge is
+    /// all that stands between the reviewer and a run under whatever opencode configuration the
+    /// pull request itself ships, and losing it — an `=` where a `merging` belongs — would not
+    /// be a compile error.
+    func testOpencodeKeepsItsReadOnlySandboxInTheMergedEnvironment() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(opencodeVerdict: .clean)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.opencode.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let opencodeCount = await runner.opencodeCount()
+        let environment = await runner.opencodeEnvironment()
+        XCTAssertEqual(opencodeCount, 1)
+        let configDirectory = try XCTUnwrap(environment["OPENCODE_CONFIG_DIR"] ?? nil)
+        XCTAssertEqual(configDirectory, fixture.paths.opencodeConfigDirectory.path)
+        let sandbox = try XCTUnwrap(environment["OPENCODE_CONFIG_CONTENT"] ?? nil)
+        XCTAssertTrue(sandbox.contains(#""read":"allow""#))
+        // opencode reads no key variable, so nothing about auth mode may reach it: injecting or
+        // unsetting one would be handing a reviewer a credential it has no way to use.
+        XCTAssertFalse(environment.keys.contains("OPENCODE_API_KEY"))
+    }
+
+    /// Reading a Keychain item is a synchronous call that blocks its thread on a modal prompt,
+    /// so it must not happen from inside a reviewer's run method: that code is `ReviewEngine`
+    /// actor-isolated, and blocking the actor's executor would stall the reviewers running in
+    /// parallel beside it and the poll loop behind them. The observable stand-in for "resolved
+    /// off the actor" is "resolved before the fan-out": every read lands while no reviewer CLI
+    /// has been launched yet. The counts also pin the second half of it — one read per reviewer,
+    /// where checking for a missing key and then injecting it used to take two.
+    func testReviewerKeysAreResolvedOnceBeforeAnyReviewerIsLaunched() async throws {
+        let fixture = try FeatureFixture()
+        let clock = ReviewerSpawnClock()
+        let runner = ReviewWorkflowMock(spawnClock: clock)
+        let credentials = CountingCredentialStore(
+            keys: [.claude: "sk-ant-test", .codex: "sk-openai-test"],
+            clock: clock
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, credentials: credentials)
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+        configuration.codex.enabled = true
+        configuration.codex.authMode = .apiKey
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        XCTAssertEqual(credentials.readCounts, [.claude: 1, .codex: 1])
+        XCTAssertEqual(
+            credentials.reviewerLaunchesWhenRead,
+            [0, 0],
+            "a key read after a reviewer started is a read made from inside the actor"
+        )
+        // And the keys still arrive where they belong, so resolving up front did not detach the
+        // reviewer from its credential.
+        let claudeEnvironment = await runner.claudeEnvironment()
+        let codexEnvironment = await runner.codexEnvironment()
+        XCTAssertEqual(claudeEnvironment["ANTHROPIC_API_KEY"] ?? nil, "sk-ant-test")
+        XCTAssertEqual(codexEnvironment["OPENAI_API_KEY"] ?? nil, "sk-openai-test")
+    }
+
+    /// A reviewer left on the signed-in CLI is never asked about, so nobody who chose that mode
+    /// is shown a Keychain prompt for a key Review Bot would not use anyway.
+    func testSessionAuthReviewersAreNeverLookedUpInTheCredentialStore() async throws {
+        let fixture = try FeatureFixture()
+        let clock = ReviewerSpawnClock()
+        let runner = ReviewWorkflowMock(spawnClock: clock)
+        let credentials = CountingCredentialStore(keys: [.claude: "sk-ant-test"], clock: clock)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, credentials: credentials)
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        XCTAssertEqual(credentials.readCounts, [:])
+    }
+
+    func testAPIKeyAuthWithoutASavedKeyFailsBeforeRunningTheCLI() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore()
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        let claudeCount = await runner.claudeCount()
+        XCTAssertEqual(claudeCount, 0, "The CLI should not run without the key it was told to use")
+        XCTAssertEqual(postCount, 0)
+        XCTAssertTrue(events.contains { $0.kind == .failed })
+    }
+
     // MARK: - Merge preview
 
     /// The point of the preview is that the reviewer can *read* it. Asserting on the file's
@@ -1070,6 +1229,65 @@ private actor EventRecorder {
     func snapshot() -> [HistoryEntry] { entries }
 }
 
+/// Counts reviewer CLI launches, readable synchronously so a `CredentialStoring` — whose
+/// `apiKey(for:)` cannot `await` anything — can stamp each read with how far the review had got.
+private final class ReviewerSpawnClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var launches = 0
+
+    func recordReviewerLaunch() {
+        lock.lock()
+        defer { lock.unlock() }
+        launches += 1
+    }
+
+    var reviewerLaunches: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return launches
+    }
+}
+
+/// Answers from a fixed map, and records every read: which reviewer it was for, and how many
+/// reviewer CLIs had already been launched by the time it was made.
+private final class CountingCredentialStore: CredentialStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private let keys: [ReviewerName: String]
+    private let clock: ReviewerSpawnClock
+    private var reads: [ReviewerName: Int] = [:]
+    private var launchesAtRead: [Int] = []
+
+    init(keys: [ReviewerName: String], clock: ReviewerSpawnClock) {
+        self.keys = keys
+        self.clock = clock
+    }
+
+    func apiKey(for reviewer: ReviewerName) -> String? {
+        let launches = clock.reviewerLaunches
+        lock.lock()
+        reads[reviewer, default: 0] += 1
+        launchesAtRead.append(launches)
+        lock.unlock()
+        return keys[reviewer]
+    }
+
+    // Nothing under test writes credentials; `InMemoryCredentialStore` covers that side.
+    func setAPIKey(_ key: String, for reviewer: ReviewerName) throws {}
+    func removeAPIKey(for reviewer: ReviewerName) throws {}
+
+    var readCounts: [ReviewerName: Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return reads
+    }
+
+    var reviewerLaunchesWhenRead: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return launchesAtRead
+    }
+}
+
 private actor ReviewWorkflowMock: CommandRunning {
     private var posts = 0
     private var claudeRuns = 0
@@ -1087,6 +1305,10 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// The merge preview as the reviewer saw it, captured at the moment `claude` was invoked —
     /// non-`nil` only when the file was actually present in the worktree by then.
     private var mergePreviewText: String?
+    /// The overrides each executable was handed, keyed by executable rather than one stored
+    /// property per reviewer: opencode's sandbox variables and the CLI reviewers' auth overrides
+    /// now come through the same seam, and a reviewer added later records itself for free.
+    private var environmentByExecutable: [String: EnvironmentOverrides] = [:]
     private let failFirstPost: Bool
     private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
@@ -1102,6 +1324,9 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let claudeBody: String
     private let baseCommitsAhead: Int
     private let trackedBaseOid: String?
+    /// Shared with a credential store so a test can tell whether keys were resolved before or
+    /// after the reviewers fanned out. `nil` for every test that does not care.
+    private let spawnClock: ReviewerSpawnClock?
 
     /// The base ref OID GitHub reports in `gh pr view`. Kept as a constant because the mock's
     /// `rev-list` has to distinguish it from the remote-tracking OID to reproduce the bug.
@@ -1132,8 +1357,10 @@ private actor ReviewWorkflowMock: CommandRunning {
         baseCommitsAhead: Int = 0,
         /// What `rev-parse refs/remotes/origin/main` resolves to. `nil` makes it fail the way git
         /// does for an unresolvable ref, which is the only case that may fall back to the snapshot.
-        trackedBaseOid: String? = "trackedbaseoid00"
+        trackedBaseOid: String? = "trackedbaseoid00",
+        spawnClock: ReviewerSpawnClock? = nil
     ) {
+        self.spawnClock = spawnClock
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
         self.codexVerdict = codexVerdict
@@ -1151,12 +1378,36 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.trackedBaseOid = trackedBaseOid
     }
 
+    /// Must not be deleted in favour of the four-argument form below. `CommandRunning` supplies
+    /// a default implementation of this overload that discards the environment, so a mock
+    /// without it still compiles and still runs every command — it simply observes `[:]`
+    /// forever, which turns every environment assertion in this file green while production
+    /// could be leaking an inherited key or losing opencode's sandbox.
+    func run(
+        _ executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: EnvironmentOverrides,
+        timeout: Int
+    ) async throws -> CommandResult {
+        environmentByExecutable[executable] = environment
+        return try await run(
+            executable,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
+            timeout: timeout
+        )
+    }
+
     func run(
         _ executable: String,
         arguments: [String],
         currentDirectory: URL?,
         timeout: Int
     ) async throws -> CommandResult {
+        if ReviewerName.allCases.compactMap(\.commandName).contains(executable) {
+            spawnClock?.recordReviewerLaunch()
+        }
         if executable == "gh", arguments.starts(with: ["api", "user"]) {
             return result(stdout: "reviewer\n")
         }
@@ -1330,6 +1581,9 @@ private actor ReviewWorkflowMock: CommandRunning {
     func claudeCount() -> Int { claudeRuns }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
+    func claudeEnvironment() -> EnvironmentOverrides { environmentByExecutable["claude"] ?? [:] }
+    func codexEnvironment() -> EnvironmentOverrides { environmentByExecutable["codex"] ?? [:] }
+    func opencodeEnvironment() -> EnvironmentOverrides { environmentByExecutable["opencode"] ?? [:] }
     func reconciliationCount() -> Int { reconciliationRuns }
     func lastReconciliationPrompt() -> String { reconciliationPrompt }
     func lastPostedBody() -> String { postedBody }

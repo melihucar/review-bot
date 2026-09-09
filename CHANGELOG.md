@@ -11,6 +11,16 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Added
+
+- **Per-reviewer sign-in mode, with API keys in the login Keychain.** Each reviewer now chooses between **Signed-in CLI** (unchanged behavior — Review Bot sends no credentials and the CLI uses its own login) and **API key**. In key mode Claude and Codex are run with `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` set from the key you saved; in session mode that variable is explicitly unset, so a key exported in your shell can no longer be picked up by accident. opencode has no key path at all — it authenticates through its own configuration — so its card offers no credential picker. Keys are stored in the macOS Keychain and never written to `config.json`; a reviewer set to key auth with no saved key fails with an explanatory message instead of silently falling back to a different account, and that failure is classified as terminal, so the reviewer is not run a second time inside the same review on a condition only a settings change can fix. Keys are read once per review, before the reviewers start, and never on the thread that draws the window or the one that runs the reviewers — a Keychain prompt blocks whatever thread raises it until you answer, so it must not be able to freeze Settings or hold up the reviewers running in parallel. That also means a rebuilt app asks at most once per reviewer per review.
+- **API keys can be supplied through the environment.** For a reviewer already set to **API key**, `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are now read from Review Bot's own environment when set, taking precedence over the Keychain, so a development run or a one-off script can supply a key without saving one. This does not change the default **Signed-in CLI** mode, which still unsets those variables — exporting a key without switching the mode leaves that reviewer on its CLI's own login. A GUI app launched from Finder or at login inherits launchd's environment rather than a shell's, so this is a development affordance — the packaged app still reads the Keychain.
+
+### Changed
+
+- **`config.json` survives a reviewer entry with missing fields.** Recording the sign-in mode meant giving each reviewer's settings a defensive decoder, so a hand-edited or truncated reviewer object no longer throws the whole file away and resets every other setting with it; anything it omits falls back instead — including the model, which falls back to the shipped default rather than an empty string no CLI could run.
+- Documented why macOS re-asks for your login password to read a saved key after a rebuild, and what actually fixes it. Each Keychain item records the saving app's identity, and without a signing identity that record is the binary's hash, so every rebuild reads as a different app. Only a Developer ID (`CODE_SIGN_IDENTITY="Developer ID Application: …" make app`) makes it stable. Two cheaper approaches were measured and **both fail**, so `CredentialStore.swift` carries a note against retrying them: a permissive item ACL (an independent partition-list check still refuses the rebuilt binary) and a self-signed certificate (fixes the ACL requirement, but the partition list still falls back to the binary hash for want of a team id).
+
 ## [0.1.16] - 2026-09-09
 
 ### Added

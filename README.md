@@ -2,7 +2,7 @@
 
 Review Bot is a native macOS menu-bar app that watches local GitHub repositories for pull requests requesting a review from the signed-in `gh` user. It reviews each new request in an isolated Git worktree with Claude, Codex, opencode, or any combination, then submits an approval, change request, or neutral review to GitHub.
 
-The app stores no GitHub or AI credentials. It uses each developer's existing authenticated command-line tools.
+GitHub access always goes through your authenticated `gh` CLI — the app never handles GitHub credentials. AI access defaults to the same model: each reviewer CLI uses its own existing login. If you would rather bill a specific API key, Claude and Codex accept one; keys are stored in the macOS Keychain and never written to `config.json`.
 
 ## Features
 
@@ -12,6 +12,7 @@ The app stores no GitHub or AI credentials. It uses each developer's existing au
 - See explicit Pending and Running review queues in the menu-bar popover.
 - Run an immediate manual check even while monitoring is paused.
 - Independently enable Claude, Codex, and opencode and configure each model and effort level.
+- Choose per reviewer whether to use its signed-in CLI or an API key held in the macOS Keychain (Claude and Codex; opencode authenticates through its own configuration).
 - Append a small developer-specific instruction prompt to every review.
 - Enforce repository-specific rules from `REVIEW.md`.
 - Run enabled reviewers independently in a read-only worktree.
@@ -25,10 +26,10 @@ The app stores no GitHub or AI credentials. It uses each developer's existing au
 - macOS 14 or newer.
 - Xcode 16 or newer, or a compatible Swift toolchain, to build the app.
 - GitHub CLI (`gh`), authenticated with `gh auth login`.
-- At least one authenticated reviewer CLI:
-  - `claude`
-  - `codex`
-  - `opencode` (opt-in reviewer; defaults to the free `opencode/deepseek-v4-flash-free` model at max effort)
+- At least one reviewer CLI:
+  - `claude` — authenticated, or an Anthropic API key.
+  - `codex` — authenticated, or an OpenAI API key.
+  - `opencode` — authenticated through its own configuration. Opt-in; defaults to the free `opencode/deepseek-v4-flash-free` model at max effort.
 - Local Git repositories with an `origin` remote on `github.com`.
 
 The configured GitHub account needs permission to read the repository and submit pull-request reviews.
@@ -64,11 +65,27 @@ Launch-at-login registration only works reliably from the packaged app in `/Appl
 2. Add one or more local Git repository folders.
 3. Confirm the inferred `owner/repository` GitHub slug.
 4. Enable Claude, Codex, or opencode and set their model and effort values. opencode is off by default.
-5. Choose a polling interval.
-6. Optionally add global custom review instructions.
-7. Select **Run now** to verify the setup.
+5. For each reviewer, choose **Signed-in CLI** or **API key**; in key mode, paste the key and select **Save**. opencode uses its own configuration and has no key field.
+6. Choose a polling interval.
+7. Optionally add global custom review instructions.
+8. Select **Run now** to verify the setup.
 
 CLI availability is shown on the Reviewers tab. Review Bot asks your login shell for its `PATH` at startup — so CLIs installed through a version manager (nvm, mise, volta, fnm, asdf) are found even when the app is launched from Finder or at login — and also searches common Homebrew, local-user, and npm binary directories in addition to the process `PATH`.
+
+## Reviewers and credentials
+
+Each reviewer independently chooses where its credentials come from:
+
+| Mode | Behavior |
+| --- | --- |
+| **Signed-in CLI** (default for `claude` and `codex`, and the only mode for `opencode`) | Review Bot passes no credentials; the CLI uses its own login. Any `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` inherited from your shell is explicitly unset, so the CLI cannot silently bill a different account. opencode is handed `OPENCODE_CONFIG_DIR`/`OPENCODE_CONFIG_CONTENT` rather than a key, so it offers no credential picker at all. |
+| **API key** | The key you saved is passed to that reviewer only, as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. |
+
+Keys are stored in your login Keychain under "Review Bot reviewer API keys" and are never written to `config.json`, the activity history, the daily logs, or a posted review. A reviewer set to API-key mode with no saved key fails with a message saying so, rather than quietly running under some other account. That failure is terminal — it will fail the same way however often it is called — so the reviewer is not run again inside that review; only a settings change fixes it.
+
+Because the app is ad-hoc signed by default, macOS asks for your login password to read a saved key after a rebuild, and "Always Allow" does not stick — it authorizes the one build in front of it. Each Keychain item records the identity of the app that saved it, and with no signing identity that record is a hash of the binary, so every rebuild looks like a different application. Only a Developer ID fixes it (`CODE_SIGN_IDENTITY="Developer ID Application: …" make app`), because the item can then record your team identity, which rebuilds keep. A self-signed certificate is not enough — it was tested; the item still falls back to recording the binary hash.
+
+For development, a reviewer already set to **API key** can take its key from Review Bot's own environment instead of the Keychain: `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are read when set, taking precedence over a saved key — useful for `make run` or a one-off script without saving anything, and it skips the Keychain prompt entirely. It changes nothing about the default **Signed-in CLI** mode, which still unsets those variables, so exporting a key without also switching that reviewer to API key leaves it on its own login. This only helps when the app is started from a shell: launched from Finder or at login it inherits launchd's environment, so the packaged app reads the Keychain.
 
 ## `REVIEW.md` policy
 
@@ -142,7 +159,7 @@ Review Bot writes to:
 └── worktrees/
 ```
 
-- `config.json` contains app settings and repository paths.
+- `config.json` contains app settings and repository paths. It records which credential source each reviewer uses, never the key itself.
 - `history.json` backs the activity-history interface and is capped at 2,000 entries.
 - `reviewed.json` contains deduplication keys.
 - `logs/` contains daily operational logs.
@@ -155,6 +172,7 @@ Use **History → Show data folder** to open this location.
 ## Privacy and safety
 
 - Source code inspected by Claude, Codex, or opencode is handled according to the account and provider configuration of those CLIs.
+- API keys are held in the macOS Keychain, passed only to the reviewer they belong to, and never written to configuration, history, logs, or a posted review.
 - Review Bot does not start a shell for repository values, PR titles, prompts, or paths; commands are passed as argument arrays.
 - Claude is restricted to read/search tools. Codex runs with its read-only sandbox. opencode runs under a read-only agent whose permissions deny everything except Read, Grep, and Glob; the pull request's own `opencode.json`/`.opencode` files cannot override that, and plugins are disabled.
 - Review work never modifies the developer's current branch or working tree.
@@ -166,7 +184,7 @@ Use **History → Show data folder** to open this location.
 make test
 ```
 
-The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, and repository inspection. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
+The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, repository inspection, credential resolution, and environment composition. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, API-key injection and session-mode key removal, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
 
 ## Roadmap
 

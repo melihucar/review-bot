@@ -39,10 +39,56 @@ enum ReviewScope: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// Where a reviewer gets its provider credentials.
+enum ReviewerAuthMode: String, Codable, CaseIterable, Identifiable {
+    /// Use whatever the reviewer's CLI is already signed in as. Review Bot passes no key.
+    case session
+    /// Use an API key held in the macOS Keychain.
+    case apiKey
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .session: "Signed-in CLI"
+        case .apiKey: "API key"
+        }
+    }
+}
+
 struct ReviewerConfiguration: Codable, Equatable {
     var enabled: Bool
     var model: String
     var effort: ReviewEffort
+    /// Never holds the key itself — only which source to use. Keys live in the Keychain.
+    var authMode: ReviewerAuthMode
+
+    init(
+        enabled: Bool,
+        model: String,
+        effort: ReviewEffort,
+        authMode: ReviewerAuthMode = .session
+    ) {
+        self.enabled = enabled
+        self.model = model
+        self.effort = effort
+        self.authMode = authMode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case model
+        case effort
+        case authMode
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        model = try values.decodeIfPresent(String.self, forKey: .model) ?? ""
+        effort = try values.decodeIfPresent(ReviewEffort.self, forKey: .effort) ?? .high
+        authMode = try values.decodeIfPresent(ReviewerAuthMode.self, forKey: .authMode) ?? .session
+    }
 }
 
 struct RepositoryConfiguration: Codable, Equatable, Identifiable {
@@ -129,11 +175,13 @@ struct ReviewBotConfiguration: Codable, Equatable {
             effort: .high
         ),
         // opencode is opt-in: the deepseek-v4-flash-free model is free, so the
-        // default pairs it with max reasoning effort at no cost.
+        // default pairs it with max reasoning effort at no cost. It signs in through its
+        // own config directory, so it never takes a key.
         opencode: ReviewerConfiguration(
             enabled: false,
             model: "opencode/deepseek-v4-flash-free",
-            effort: .max
+            effort: .max,
+            authMode: .session
         ),
         customPrompt: "",
         decisionPolicy: .default,
@@ -142,6 +190,11 @@ struct ReviewBotConfiguration: Codable, Equatable {
         failureBudget: .default,
         maxConcurrentReviews: 3
     )
+
+    /// `decoded` unless it is blank, in which case the shipped default.
+    private static func model(_ decoded: String, or fallback: String) -> String {
+        decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? fallback : decoded
+    }
 
     private enum CodingKeys: String, CodingKey {
         case repositories
@@ -218,6 +271,18 @@ struct ReviewBotConfiguration: Codable, Equatable {
         if !ReviewEffort.opencodeCases.contains(opencode.effort) {
             opencode.effort = .max
         }
+        // `ReviewerConfiguration.init(from:)` decodes a missing `model` to an empty string so a
+        // hand-edited config still loads instead of throwing the whole file away. An empty model
+        // is not runnable, though — the CLI would be invoked as `--model ""` and fail in a way
+        // that reads as a provider outage — so fall back to the shipped default here, where the
+        // reviewer's identity is known, exactly as an out-of-range effort does above.
+        claude.model = Self.model(claude.model, or: Self.default.claude.model)
+        codex.model = Self.model(codex.model, or: Self.default.codex.model)
+        opencode.model = Self.model(opencode.model, or: Self.default.opencode.model)
+        // opencode signs in through its own config directory and takes no key, so there is
+        // nothing to hand it in API-key mode. Pinning the mode here keeps a hand-edited or
+        // migrated config from selecting one where Review Bot would inject nothing.
+        opencode.authMode = .session
         customPrompt = try values.decodeIfPresent(String.self, forKey: .customPrompt) ?? ""
         decisionPolicy = try values.decodeIfPresent(
             DecisionPolicy.self,
@@ -314,6 +379,65 @@ enum ReviewerName: String, Codable, CaseIterable {
     case claude = "Claude"
     case codex = "Codex"
     case opencode = "opencode"
+
+    /// The CLI this reviewer shells out to, or `nil` for a reviewer that is not backed by a
+    /// command at all.
+    var commandName: String? {
+        switch self {
+        case .claude: "claude"
+        case .codex: "codex"
+        case .opencode: "opencode"
+        }
+    }
+
+    /// Only a CLI-backed reviewer can borrow a login that already exists on this machine.
+    var supportsSessionAuth: Bool { commandName != nil }
+
+    /// Whether a key of the developer's own can be pointed at this reviewer at all. That takes
+    /// a variable to deliver it through: opencode names none — it is credentialed through its
+    /// own config directory — so offering it an API-key mode would produce a reviewer Review Bot
+    /// cannot actually hand anything to.
+    var supportsAPIKeyAuth: Bool { apiKeyEnvironmentVariable != nil }
+
+    /// The variable a CLI-backed reviewer reads its API key from, when the developer
+    /// chooses key auth over the CLI's own session.
+    var apiKeyEnvironmentVariable: String? {
+        switch self {
+        case .claude: "ANTHROPIC_API_KEY"
+        case .codex: "OPENAI_API_KEY"
+        // opencode is credentialed through OPENCODE_CONFIG_DIR, not through an injected key,
+        // so there is nothing to hand its child process.
+        case .opencode: nil
+        }
+    }
+
+    /// The variable Review Bot itself reads a key from, taking precedence over the Keychain.
+    /// Unlike `apiKeyEnvironmentVariable` — which is outbound, handed to a CLI child process —
+    /// this is inbound, and every reviewer has one. It is how `make run`, a test, or a one-off
+    /// probe supplies a key without touching the developer's Keychain. Note that a GUI app
+    /// started from Finder or at login inherits launchd's environment, not a shell's, so this is
+    /// a development affordance: the packaged app still reads the Keychain. opencode's entry
+    /// exists only because the property is total; it is never consulted, since opencode is
+    /// pinned to session auth.
+    var apiKeyOverrideEnvironmentVariable: String {
+        switch self {
+        case .claude: "ANTHROPIC_API_KEY"
+        case .codex: "OPENAI_API_KEY"
+        case .opencode: "OPENCODE_API_KEY"
+        }
+    }
+}
+
+extension ReviewBotConfiguration {
+    /// The stored settings for one reviewer. A total switch, so credential code can ask about a
+    /// reviewer it was handed rather than every caller repeating the mapping.
+    func settings(for reviewer: ReviewerName) -> ReviewerConfiguration {
+        switch reviewer {
+        case .claude: claude
+        case .codex: codex
+        case .opencode: opencode
+        }
+    }
 }
 
 enum ReviewVerdict: String, Codable, CaseIterable {
@@ -363,6 +487,10 @@ enum ReviewerFailureClass: Equatable {
             "please run `codex login`",
             "please run `claude login`",
             "credit balance is too low",
+            // Review Bot's own message for a reviewer set to API-key auth whose key is absent
+            // or whose Keychain prompt was denied. Only Settings can fix that, so retrying
+            // would spend the failure budget on a request that cannot start.
+            "key could not be read",
         ]
         return terminalMarkers.contains { haystack.contains($0) } ? .terminal : .transient
     }

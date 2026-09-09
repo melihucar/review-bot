@@ -85,6 +85,147 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertEqual(configuration.reviewScope, .incremental)
     }
 
+    func testConfigurationWithoutAuthModeDefaultsToSession() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true, "model": "claude", "effort": "high" },
+          "codex": { "enabled": false, "model": "codex", "effort": "medium" },
+          "customPrompt": ""
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        // A config written before per-reviewer sign-in existed must keep behaving exactly as it
+        // did: every reviewer on its CLI's own login, with no credential injected.
+        XCTAssertEqual(configuration.claude.authMode, .session)
+        XCTAssertEqual(configuration.codex.authMode, .session)
+    }
+
+    func testOpencodeIsAlwaysSessionAuthEvenIfConfigSaysOtherwise() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "opencode": {
+            "enabled": true, "model": "opencode/deepseek-v4-flash-free", "effort": "max",
+            "authMode": "apiKey"
+          }
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        // opencode authenticates through its own config directory and reads no key variable, so
+        // `environmentOverrides` would inject nothing while the settings panel claimed a key was
+        // in use.
+        XCTAssertEqual(configuration.opencode.authMode, .session)
+        XCTAssertFalse(ReviewerName.opencode.supportsAPIKeyAuth)
+    }
+
+    /// Adding `ReviewerConfiguration.init(from:)` for `authMode` made every other key optional
+    /// too, so a reviewer object that omits `model` now loads instead of throwing the file away
+    /// and falling back to `.default`. That is the right trade — but an empty model is not
+    /// runnable, so it has to be filled in rather than carried into `--model ""`.
+    func testAReviewerWithNoModelFallsBackToTheShippedDefault() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "claude": { "enabled": true },
+          "codex": { "enabled": true, "model": "   ", "effort": "high" }
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(configuration.claude.model, ReviewBotConfiguration.default.claude.model)
+        XCTAssertEqual(configuration.codex.model, ReviewBotConfiguration.default.codex.model)
+        // The rest of the defensive decoding is unchanged: what was present is kept.
+        XCTAssertTrue(configuration.claude.enabled)
+        XCTAssertEqual(configuration.claude.effort, .high)
+    }
+
+    func testAuthModeRoundTripsAndConfigurationNeverCarriesTheKey() throws {
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.authMode = .apiKey
+
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(configuration)
+        let json = String(decoding: data, as: UTF8.self)
+
+        // Keys live in the Keychain; the config file must only record which source to use.
+        XCTAssertTrue(json.contains("\"authMode\":\"apiKey\""))
+        XCTAssertFalse(json.lowercased().contains("\"apikey\":\""))
+        XCTAssertFalse(json.lowercased().contains("secret"))
+
+        let decoded = try JSONDecoder().decode(ReviewBotConfiguration.self, from: data)
+        XCTAssertEqual(decoded.claude.authMode, .apiKey)
+        XCTAssertEqual(decoded.codex.authMode, .session)
+    }
+
+    func testSettingsLookupReturnsEachReviewersOwnConfiguration() {
+        // `settings(for:)` is a switch over identically typed properties, so a copy-paste there
+        // would hand one reviewer another's model, effort, and auth mode with nothing to catch
+        // it — and it is what decides which reviewer a saved key is looked up for.
+        var configuration = ReviewBotConfiguration.default
+        configuration.claude.model = "model-claude"
+        configuration.codex.model = "model-codex"
+        configuration.opencode.model = "model-opencode"
+
+        for reviewer in ReviewerName.allCases {
+            XCTAssertEqual(
+                configuration.settings(for: reviewer).model,
+                "model-\(reviewer.rawValue.lowercased())",
+                "\(reviewer.rawValue) reads another reviewer's configuration"
+            )
+        }
+    }
+
+    /// The "adding a reviewer" checklist, as assertions. Every one of these is a total switch
+    /// over `ReviewerName`, so a new case compiles only once each has an arm — but nothing makes
+    /// that arm *correct*, and a wrong one is a key read from the wrong variable or handed to
+    /// the wrong CLI.
+    func testEveryReviewerDeclaresACoherentCredentialSurface() {
+        XCTAssertEqual(ReviewerName.allCases.map(\.commandName), [
+            "claude",
+            "codex",
+            "opencode",
+        ])
+        // Outbound: what a CLI child process is handed. opencode takes none.
+        XCTAssertEqual(ReviewerName.allCases.map(\.apiKeyEnvironmentVariable), [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            nil,
+        ])
+        // Inbound: what Review Bot itself reads a key from, ahead of the Keychain. Total, so it
+        // names one even for opencode, which never consults it.
+        XCTAssertEqual(ReviewerName.allCases.map(\.apiKeyOverrideEnvironmentVariable), [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENCODE_API_KEY",
+        ])
+        let inbound = ReviewerName.allCases.map(\.apiKeyOverrideEnvironmentVariable)
+        XCTAssertEqual(Set(inbound).count, inbound.count, "two reviewers would share a key")
+
+        // Only a CLI can borrow a login; only a reviewer Review Bot can hand a key to may be put
+        // in key mode. opencode is the reviewer that separates the two predicates.
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsSessionAuth), [true, true, true])
+        XCTAssertEqual(ReviewerName.allCases.map(\.supportsAPIKeyAuth), [true, true, false])
+        XCTAssertFalse(
+            ReviewerName.allCases.contains { !$0.supportsSessionAuth && !$0.supportsAPIKeyAuth },
+            "a reviewer with neither auth mode could never be credentialed at all"
+        )
+    }
+
     func testLastReviewedStoreRoundTripsHeadPerPullRequest() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ReviewBotLastReviewed-\(UUID().uuidString)", isDirectory: true)
