@@ -33,9 +33,24 @@ struct StoragePaths {
     var opencodeAgentFile: URL {
         opencodeConfigDirectory.appendingPathComponent("agents/review-bot.md")
     }
+    /// Same idea for Gemini: a policy file denying every mutating tool, kept
+    /// outside the worktree so a pull request can't rewrite its own sandbox.
+    var geminiConfigDirectory: URL {
+        root.appendingPathComponent("gemini", isDirectory: true)
+    }
+    var geminiPolicyFile: URL {
+        geminiConfigDirectory.appendingPathComponent("read-only.toml")
+    }
 
     func prepare() throws {
-        for directory in [root, worktreesDirectory, reviewsDirectory, logsDirectory, opencodeConfigDirectory] {
+        for directory in [
+            root,
+            worktreesDirectory,
+            reviewsDirectory,
+            logsDirectory,
+            opencodeConfigDirectory,
+            geminiConfigDirectory,
+        ] {
             try FileManager.default.createDirectory(
                 at: directory,
                 withIntermediateDirectories: true

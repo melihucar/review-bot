@@ -126,6 +126,7 @@ private struct ConcurrencyFixture {
             claude: ReviewerConfiguration(enabled: true, model: "claude-test", effort: .high),
             codex: ReviewerConfiguration(enabled: false, model: "codex-test", effort: .high),
             opencode: ReviewerConfiguration(enabled: false, model: "opencode-test", effort: .max),
+            gemini: ReviewerConfiguration(enabled: false, model: "gemini-test", effort: .high),
             customPrompt: "",
             maxConcurrentReviews: concurrency
         )

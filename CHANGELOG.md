@@ -11,6 +11,21 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.1.17-rc.1] - 2026-09-12
+
+A release candidate for 0.1.17, published to test the new Gemini reviewer before
+it ships. Gemini is off by default, so enabling it is the only thing that changes
+behaviour; every other reviewer works exactly as it did in 0.1.16.
+
+### Added
+
+- **Gemini joins Claude, Codex, and opencode as a reviewer.** It is off by default and, once enabled on the dashboard, runs alongside the others in the same parallel panel, contributes a verdict to the same strictest-wins gate, and can adjudicate a reconciliation when neither Claude nor Codex is enabled. It runs headless (`gemini --prompt … --output-format json`) against the review worktree. Defaults to `gemini-3-pro-preview`.
+- Gemini's reviews are confined to reading by a policy file Review Bot writes into its own data directory and passes with `--policy`. That lands in Gemini's *user* policy tier, which outranks the `.gemini/` settings and policies a pull request can ship in its own tree, and it denies `run_shell_command`, `write_file`, `replace`, `activate_skill`, `web_fetch`, and `google_web_search`. It also denies `enter_plan_mode`/`exit_plan_mode`: a headless run auto-approves leaving plan mode, and leaving it switches the CLI into YOLO. Reviews also run with `--extensions none`, so they don't depend on whichever extensions happen to be installed, and with `--skip-trust`, since the worktree is a scratch checkout Gemini would otherwise refuse as an untrusted folder.
+
+### Changed
+
+- The Gemini card on the dashboard has no effort picker, because its CLI takes no effort flag — a control there would have done nothing. Reviewer cards now omit the picker whenever a reviewer offers no levels, and the status line names Gemini without one.
+
 ## [0.1.16] - 2026-09-09
 
 ### Added
@@ -163,7 +178,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.1.17-rc.1...HEAD
+[0.1.17-rc.1]: https://github.com/melihucar/review-bot/compare/v0.1.16...v0.1.17-rc.1
 [0.1.16]: https://github.com/melihucar/review-bot/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/melihucar/review-bot/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/melihucar/review-bot/compare/v0.1.13...v0.1.14

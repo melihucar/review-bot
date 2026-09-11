@@ -360,6 +360,52 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(events.last?.kind, .approved)
     }
 
+    func testGeminiOnlyReviewPostsApprovalAndRunsReadOnly() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(geminiVerdict: .clean)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.gemini.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let claudeCount = await runner.claudeCount()
+        let geminiCount = await runner.geminiCount()
+        let arguments = await runner.geminiInvocation()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(claudeCount, 0)
+        // A verdict at all proves the JSON envelope was unwrapped: the raw stdout the
+        // mock returns has no trailing `VERDICT:` line for the parser to find.
+        XCTAssertEqual(geminiCount, 1)
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertEqual(events.last?.kind, .approved)
+
+        // The sandbox flags are the whole reason this reviewer is safe to run against
+        // a pull request's own checkout, so they are asserted rather than assumed.
+        XCTAssertTrue(arguments.contains("--skip-trust"))
+        XCTAssertEqual(arguments.firstIndex(of: "--extensions").map { arguments[$0 + 1] }, "none")
+        XCTAssertEqual(arguments.firstIndex(of: "--output-format").map { arguments[$0 + 1] }, "json")
+        let policyPath = try XCTUnwrap(
+            arguments.firstIndex(of: "--policy").map { arguments[$0 + 1] }
+        )
+        XCTAssertEqual(policyPath, fixture.paths.geminiPolicyFile.path)
+        // …and the policy has to be on disk by the time the CLI is invoked, outside
+        // the worktree so the branch under review cannot rewrite its own sandbox.
+        let policy = try String(contentsOfFile: policyPath, encoding: .utf8)
+        for denied in ["run_shell_command", "write_file", "replace", "exit_plan_mode"] {
+            XCTAssertTrue(policy.contains(denied), "policy should deny \(denied)")
+        }
+        XCTAssertTrue(policy.contains("decision = \"deny\""))
+    }
+
     func testAllThreeReviewersRunInParallelAndPost() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(
@@ -1051,6 +1097,7 @@ private struct FeatureFixture {
             claude: ReviewerConfiguration(enabled: true, model: "claude-test", effort: .high),
             codex: ReviewerConfiguration(enabled: false, model: "codex-test", effort: .high),
             opencode: ReviewerConfiguration(enabled: false, model: "opencode-test", effort: .max),
+            gemini: ReviewerConfiguration(enabled: false, model: "gemini-test", effort: .high),
             customPrompt: "Check public API compatibility."
         )
     }
@@ -1075,6 +1122,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var claudeRuns = 0
     private var codexRuns = 0
     private var opencodeRuns = 0
+    private var geminiRuns = 0
+    private var geminiArgs: [String] = []
     private var reconciliationRuns = 0
     private var reconciliationPrompt = ""
     private var postedBody = ""
@@ -1091,6 +1140,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let claudeVerdict: ReviewVerdict
     private let codexVerdict: ReviewVerdict
     private let opencodeVerdict: ReviewVerdict
+    private let geminiVerdict: ReviewVerdict
     private let reconciledVerdict: ReviewVerdict?
     private let failCodex: Bool
     private let codexFailureMessage: String
@@ -1115,6 +1165,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         claudeVerdict: ReviewVerdict = .clean,
         codexVerdict: ReviewVerdict = .clean,
         opencodeVerdict: ReviewVerdict = .clean,
+        geminiVerdict: ReviewVerdict = .clean,
         reconciledVerdict: ReviewVerdict? = nil,
         failCodex: Bool = false,
         /// What the failing `codex` writes to stderr. The default is unrecognisable, so it
@@ -1138,6 +1189,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.claudeVerdict = claudeVerdict
         self.codexVerdict = codexVerdict
         self.opencodeVerdict = opencodeVerdict
+        self.geminiVerdict = geminiVerdict
         self.reconciledVerdict = reconciledVerdict
         self.failCodex = failCodex
         self.codexFailureMessage = codexFailureMessage
@@ -1301,6 +1353,28 @@ private actor ReviewWorkflowMock: CommandRunning {
             opencodeRuns += 1
             return result(stdout: "## Summary\nopencode result.\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
         }
+        if executable == "gemini" {
+            geminiArgs = arguments
+            let prompt = arguments.firstIndex(of: "--prompt").flatMap { index in
+                arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
+            } ?? ""
+            // Gemini adjudicates only when neither Claude nor Codex is enabled, but the
+            // branch has to exist or such a run would be counted as an ordinary review.
+            let isReconciliation = prompt.contains("## How to reconcile")
+            if isReconciliation {
+                reconciliationRuns += 1
+                reconciliationPrompt = prompt
+            } else {
+                geminiRuns += 1
+            }
+            let body = isReconciliation
+                ? "## Reconciliation\nRe-checked findings.\n\nVERDICT: \((reconciledVerdict ?? .clean).rawValue)\n"
+                : "## Summary\nGemini result.\n\nVERDICT: \(geminiVerdict.rawValue)\n"
+            // The real CLI is invoked with `--output-format json`, so the reviewer only
+            // sees a verdict if `geminiResponse` unwraps the envelope.
+            let payload = try! JSONSerialization.data(withJSONObject: ["response": body])
+            return result(stdout: String(decoding: payload, as: UTF8.self))
+        }
         if executable == "gh", arguments.starts(with: ["pr", "review", "42"]) {
             posts += 1
             postArgument = arguments.first(where: {
@@ -1330,6 +1404,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func claudeCount() -> Int { claudeRuns }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
+    func geminiCount() -> Int { geminiRuns }
+    func geminiInvocation() -> [String] { geminiArgs }
     func reconciliationCount() -> Int { reconciliationRuns }
     func lastReconciliationPrompt() -> String { reconciliationPrompt }
     func lastPostedBody() -> String { postedBody }

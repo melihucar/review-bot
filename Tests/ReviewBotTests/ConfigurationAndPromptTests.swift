@@ -26,6 +26,31 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertFalse(configuration.opencode.enabled)
         XCTAssertEqual(configuration.opencode.model, "opencode/deepseek-v4-flash-free")
         XCTAssertEqual(configuration.opencode.effort, .max)
+        // Gemini is newer still, and likewise opt-in rather than switched on under
+        // an existing user by an upgrade.
+        XCTAssertFalse(configuration.gemini.enabled)
+        XCTAssertEqual(configuration.gemini.model, "gemini-3-pro-preview")
+    }
+
+    func testGeminiEffortIsNotClampedBecauseItsCLIHasNone() throws {
+        let json = #"""
+        {
+          "repositories": [],
+          "gemini": { "enabled": true, "model": "gemini-3-pro-preview", "effort": "xhigh" }
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        // Unlike the other reviewers, no stored effort is invalid here — the value is
+        // inert because the CLI takes no such flag — so decoding preserves it rather
+        // than rewriting the user's file on load.
+        XCTAssertTrue(configuration.gemini.enabled)
+        XCTAssertEqual(configuration.gemini.effort, .xhigh)
+        XCTAssertTrue(ReviewEffort.geminiCases.isEmpty)
     }
 
     func testOpencodeConfigurationDecodesAndClampsEffortToMax() throws {

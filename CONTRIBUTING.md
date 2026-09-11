@@ -7,7 +7,7 @@ built with SwiftUI and the Swift Package Manager.
 
 - macOS 14 or newer
 - Xcode 16 or newer (or a compatible Swift 6 toolchain)
-- The CLIs the app drives, if you want to test end to end: `gh`, `claude`, `codex`
+- The CLIs the app drives, if you want to test end to end: `gh`, `claude`, `codex`, `opencode`, `gemini`
 
 ## Build, run, and test
 

@@ -1,6 +1,6 @@
 # Review Bot
 
-Review Bot is a native macOS menu-bar app that watches local GitHub repositories for pull requests requesting a review from the signed-in `gh` user. It reviews each new request in an isolated Git worktree with Claude, Codex, opencode, or any combination, then submits an approval, change request, or neutral review to GitHub.
+Review Bot is a native macOS menu-bar app that watches local GitHub repositories for pull requests requesting a review from the signed-in `gh` user. It reviews each new request in an isolated Git worktree with Claude, Codex, opencode, Gemini, or any combination, then submits an approval, change request, or neutral review to GitHub.
 
 The app stores no GitHub or AI credentials. It uses each developer's existing authenticated command-line tools.
 
@@ -11,7 +11,7 @@ The app stores no GitHub or AI credentials. It uses each developer's existing au
 - Pause and resume automatic monitoring from the menu bar or settings.
 - See explicit Pending and Running review queues in the menu-bar popover.
 - Run an immediate manual check even while monitoring is paused.
-- Independently enable Claude, Codex, and opencode and configure each model and effort level.
+- Independently enable Claude, Codex, opencode, and Gemini and configure each model and effort level.
 - Append a small developer-specific instruction prompt to every review.
 - Enforce repository-specific rules from `REVIEW.md`.
 - Run enabled reviewers independently in a read-only worktree.
@@ -29,6 +29,7 @@ The app stores no GitHub or AI credentials. It uses each developer's existing au
   - `claude`
   - `codex`
   - `opencode` (opt-in reviewer; defaults to the free `opencode/deepseek-v4-flash-free` model at max effort)
+  - `gemini` (opt-in reviewer; defaults to `gemini-3-pro-preview`. Its CLI has no effort setting, so that card has no effort control)
 - Local Git repositories with an `origin` remote on `github.com`.
 
 The configured GitHub account needs permission to read the repository and submit pull-request reviews.
@@ -63,7 +64,7 @@ Launch-at-login registration only works reliably from the packaged app in `/Appl
 1. Open the menu-bar icon and choose **Settings…**.
 2. Add one or more local Git repository folders.
 3. Confirm the inferred `owner/repository` GitHub slug.
-4. Enable Claude, Codex, or opencode and set their model and effort values. opencode is off by default.
+4. Enable Claude, Codex, opencode, or Gemini and set their model and effort values. opencode and Gemini are off by default.
 5. Choose a polling interval.
 6. Optionally add global custom review instructions.
 7. Select **Run now** to verify the setup.
@@ -137,6 +138,7 @@ Review Bot writes to:
 ├── history.json
 ├── reviewed.json
 ├── opencode/
+├── gemini/
 ├── logs/
 ├── reviews/
 └── worktrees/
@@ -149,14 +151,15 @@ Review Bot writes to:
 - `reviews/` contains the aggregated Markdown submitted to GitHub.
 - `worktrees/` is temporary and normally empty between reviews.
 - `opencode/` holds the read-only agent definition the opencode reviewer runs under.
+- `gemini/` holds the read-only policy file the Gemini reviewer runs under.
 
 Use **History → Show data folder** to open this location.
 
 ## Privacy and safety
 
-- Source code inspected by Claude, Codex, or opencode is handled according to the account and provider configuration of those CLIs.
+- Source code inspected by Claude, Codex, opencode, or Gemini is handled according to the account and provider configuration of those CLIs.
 - Review Bot does not start a shell for repository values, PR titles, prompts, or paths; commands are passed as argument arrays.
-- Claude is restricted to read/search tools. Codex runs with its read-only sandbox. opencode runs under a read-only agent whose permissions deny everything except Read, Grep, and Glob; the pull request's own `opencode.json`/`.opencode` files cannot override that, and plugins are disabled.
+- Claude is restricted to read/search tools. Codex runs with its read-only sandbox. opencode runs under a read-only agent whose permissions deny everything except Read, Grep, and Glob; the pull request's own `opencode.json`/`.opencode` files cannot override that, and plugins are disabled. Gemini runs under a policy loaded at its user tier, which outranks any `.gemini/` settings or policies the pull request ships; it denies shell, file writes, and web access, and denies the plan-mode transitions that would otherwise let a headless run drop into YOLO. Extensions are disabled.
 - Review work never modifies the developer's current branch or working tree.
 - No review is marked complete until GitHub accepts the submitted result.
 

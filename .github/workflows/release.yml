@@ -51,3 +51,7 @@ jobs:
           files: dist/ReviewBot-*.dmg
           body_path: release-notes.md
           fail_on_unmatched_files: true
+          # Semver marks a pre-release with a hyphen (v0.1.17-rc.1), and the
+          # action publishes a full release unless told otherwise — which would
+          # make a release candidate the repo's "Latest" download.
+          prerelease: ${{ contains(github.ref_name, '-') }}

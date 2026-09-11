@@ -10,7 +10,7 @@ enum ReviewEngineError: LocalizedError {
         switch self {
         case let .commandFailed(message): message
         case let .invalidResponse(message): message
-        case .noReviewersEnabled: "Enable Claude, Codex, or opencode before running reviews."
+        case .noReviewersEnabled: "Enable Claude, Codex, opencode, or Gemini before running reviews."
         case let .reviewIncomplete(message): message
         }
     }
@@ -70,7 +70,8 @@ actor ReviewEngine {
         }
         guard configuration.claude.enabled
             || configuration.codex.enabled
-            || configuration.opencode.enabled else {
+            || configuration.opencode.enabled
+            || configuration.gemini.enabled else {
             await onStatus(ReviewEngineError.noReviewersEnabled.localizedDescription)
             return
         }
@@ -980,11 +981,12 @@ actor ReviewEngine {
         )
 
         // Runs every enabled reviewer in parallel, preserving a deterministic
-        // output order (Claude, Codex, opencode) regardless of completion order.
+        // output order (Claude, Codex, opencode, Gemini) regardless of completion order.
         let enabled: [(ReviewerName, ReviewerConfiguration)] = [
             (.claude, configuration.claude),
             (.codex, configuration.codex),
             (.opencode, configuration.opencode),
+            (.gemini, configuration.gemini),
         ].filter { $0.1.enabled }
 
         let order = Dictionary(uniqueKeysWithValues: enabled.enumerated().map { ($0.element.0, $0.offset) })
@@ -1058,6 +1060,8 @@ actor ReviewEngine {
             await runCodex(configuration: configuration, prompt: prompt, worktree: worktree)
         case .opencode:
             await runOpencode(configuration: configuration, prompt: prompt, worktree: worktree)
+        case .gemini:
+            await runGemini(configuration: configuration, prompt: prompt, worktree: worktree)
         }
     }
 
@@ -1084,7 +1088,7 @@ actor ReviewEngine {
         }
         let prompt = DefaultPrompt.reconciliation(reviews: panel)
         // Reviewers are enabled whenever verdicts disagree; prefer Claude as
-        // adjudicator, then Codex, then opencode.
+        // adjudicator, then Codex, then Gemini, then opencode.
         if configuration.claude.enabled {
             return await runClaude(
                 configuration: configuration.claude,
@@ -1095,6 +1099,13 @@ actor ReviewEngine {
         if configuration.codex.enabled {
             return await runCodex(
                 configuration: configuration.codex,
+                prompt: prompt,
+                worktree: worktree
+            )
+        }
+        if configuration.gemini.enabled {
+            return await runGemini(
+                configuration: configuration.gemini,
                 prompt: prompt,
                 worktree: worktree
             )
@@ -1271,6 +1282,104 @@ actor ReviewEngine {
         } catch {
             return false
         }
+    }
+
+    private func runGemini(
+        configuration: ReviewerConfiguration,
+        prompt: String,
+        worktree: URL
+    ) async -> ReviewerResult {
+        guard ensureGeminiPolicy() else {
+            return failedReviewer(
+                .gemini,
+                configuration,
+                message: "could not write the read-only Gemini policy file"
+            )
+        }
+        do {
+            let result = try await runner.run(
+                "gemini",
+                arguments: [
+                    "--model", configuration.model,
+                    "--policy", paths.geminiPolicyFile.path,
+                    // The worktree is a scratch checkout the user has never opened,
+                    // so Gemini would otherwise refuse it as an untrusted folder.
+                    "--skip-trust",
+                    // Reviews must not depend on whichever extensions the user
+                    // happens to have installed — or on ones the branch ships.
+                    "--extensions", "none",
+                    "--output-format", "json",
+                    "--prompt", prompt,
+                ],
+                currentDirectory: worktree,
+                timeout: 900
+            )
+            guard result.succeeded else {
+                return failedReviewer(.gemini, configuration, message: conciseError(result))
+            }
+            let output = Self.geminiResponse(result.stdout)
+            return ReviewerResult(
+                reviewer: .gemini,
+                model: configuration.model,
+                output: output,
+                verdict: VerdictParser.parse(output),
+                failure: nil
+            )
+        } catch {
+            return failedReviewer(.gemini, configuration, error: error)
+        }
+    }
+
+    /// Writes the policy that keeps the Gemini reviewer read-only. Returns `false`
+    /// (and the reviewer then fails cleanly) if the file cannot be created.
+    ///
+    /// `--policy` loads it into Gemini's *user* tier, which outranks the
+    /// `.gemini/` settings and policies a pull request can ship in its own tree
+    /// (those are workspace tier). Headless Gemini already denies the mutating
+    /// tools, so this is a second lock on the same door — except for the plan-mode
+    /// pair, which is not belt-and-braces: a non-interactive run auto-approves
+    /// `exit_plan_mode`, and leaving plan mode switches the CLI into YOLO.
+    private func ensureGeminiPolicy() -> Bool {
+        let file = paths.geminiPolicyFile
+        do {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let policy = """
+            [[rule]]
+            toolName = [
+              "run_shell_command",
+              "write_file",
+              "replace",
+              "activate_skill",
+              "web_fetch",
+              "google_web_search",
+              "enter_plan_mode",
+              "exit_plan_mode"
+            ]
+            decision = "deny"
+            priority = 900
+            """
+            try Data(policy.utf8).write(to: file, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// `gemini --output-format json` wraps the answer in `{"response": …}`, which
+    /// keeps the reviewer's Markdown clean of the CLI's own chatter. Falls back to
+    /// raw stdout so a build that prints plain text still yields a parsable verdict.
+    static func geminiResponse(_ stdout: String) -> String {
+        struct Payload: Decodable { let response: String }
+        guard let payload = try? JSONDecoder().decode(
+            Payload.self,
+            from: Data(stdout.utf8)
+        ) else {
+            return stdout
+        }
+        return payload.response
     }
 
     private func failedReviewer(
@@ -1459,6 +1568,10 @@ actor ReviewEngine {
         }
         if configuration.opencode.enabled {
             reviewers.append("opencode (\(configuration.opencode.effort.label))")
+        }
+        // No effort for Gemini: its CLI has no such flag, so naming one would lie.
+        if configuration.gemini.enabled {
+            reviewers.append("Gemini")
         }
         return "Running " + reviewers.joined(separator: " and ") + "."
     }

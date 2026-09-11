@@ -17,10 +17,13 @@ enum ReviewEffort: String, Codable, CaseIterable, Identifiable {
     }
 
     // Claude, Codex, and opencode expose different top-tier effort names, so
-    // each reviewer only offers the levels its CLI accepts.
+    // each reviewer only offers the levels its CLI accepts. Gemini's CLI has no
+    // effort flag at all — its empty list hides the picker rather than offering
+    // a control that would silently do nothing.
     static let claudeCases: [ReviewEffort] = [.low, .medium, .high, .max]
     static let codexCases: [ReviewEffort] = [.low, .medium, .high, .xhigh]
     static let opencodeCases: [ReviewEffort] = [.low, .medium, .high, .max]
+    static let geminiCases: [ReviewEffort] = []
 }
 
 /// How much of a pull request each review looks at.
@@ -98,6 +101,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
     var claude: ReviewerConfiguration
     var codex: ReviewerConfiguration
     var opencode: ReviewerConfiguration
+    var gemini: ReviewerConfiguration
     var customPrompt: String
     var decisionPolicy: DecisionPolicy
     var reviewScope: ReviewScope
@@ -135,6 +139,13 @@ struct ReviewBotConfiguration: Codable, Equatable {
             model: "opencode/deepseek-v4-flash-free",
             effort: .max
         ),
+        // Gemini is opt-in too. `effort` is stored but unused — the CLI takes no
+        // effort flag — so it keeps the shared default rather than a meaningful value.
+        gemini: ReviewerConfiguration(
+            enabled: false,
+            model: "gemini-3-pro-preview",
+            effort: .high
+        ),
         customPrompt: "",
         decisionPolicy: .default,
         reviewScope: .fullPullRequest,
@@ -150,6 +161,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         case claude
         case codex
         case opencode
+        case gemini
         case customPrompt
         case decisionPolicy
         case reviewScope
@@ -165,6 +177,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         claude: ReviewerConfiguration,
         codex: ReviewerConfiguration,
         opencode: ReviewerConfiguration,
+        gemini: ReviewerConfiguration,
         customPrompt: String,
         decisionPolicy: DecisionPolicy = .default,
         reviewScope: ReviewScope = .fullPullRequest,
@@ -178,6 +191,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         self.claude = claude
         self.codex = codex
         self.opencode = opencode
+        self.gemini = gemini
         self.customPrompt = customPrompt
         self.decisionPolicy = decisionPolicy
         self.reviewScope = reviewScope
@@ -209,6 +223,10 @@ struct ReviewBotConfiguration: Codable, Equatable {
             ReviewerConfiguration.self,
             forKey: .opencode
         ) ?? ReviewBotConfiguration.default.opencode
+        gemini = try values.decodeIfPresent(
+            ReviewerConfiguration.self,
+            forKey: .gemini
+        ) ?? ReviewBotConfiguration.default.gemini
         if !ReviewEffort.claudeCases.contains(claude.effort) {
             claude.effort = .high
         }
@@ -218,6 +236,8 @@ struct ReviewBotConfiguration: Codable, Equatable {
         if !ReviewEffort.opencodeCases.contains(opencode.effort) {
             opencode.effort = .max
         }
+        // Gemini has no clamp: its CLI takes no effort flag, so no stored value
+        // is wrong and there is no valid set to snap one back to.
         customPrompt = try values.decodeIfPresent(String.self, forKey: .customPrompt) ?? ""
         decisionPolicy = try values.decodeIfPresent(
             DecisionPolicy.self,
@@ -314,6 +334,7 @@ enum ReviewerName: String, Codable, CaseIterable {
     case claude = "Claude"
     case codex = "Codex"
     case opencode = "opencode"
+    case gemini = "Gemini"
 }
 
 enum ReviewVerdict: String, Codable, CaseIterable {
@@ -363,6 +384,12 @@ enum ReviewerFailureClass: Equatable {
             "please run `codex login`",
             "please run `claude login`",
             "credit balance is too low",
+            // Gemini: quota, a rejected credential, and a CLI build whose OAuth
+            // client the service no longer accepts — none of which a second call fixes.
+            "resource_exhausted",
+            "error authenticating",
+            "api key not valid",
+            "this client is no longer supported",
         ]
         return terminalMarkers.contains { haystack.contains($0) } ? .terminal : .transient
     }

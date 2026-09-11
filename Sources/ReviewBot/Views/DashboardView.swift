@@ -338,8 +338,17 @@ private struct ReviewersSettingsView: View {
                     isAvailable: model.toolAvailability["opencode"] == true
                 )
 
+                ReviewerCard(
+                    title: "Gemini",
+                    icon: "sparkle.magnifyingglass",
+                    command: "gemini",
+                    configuration: $settings.configuration.gemini,
+                    efforts: ReviewEffort.geminiCases,
+                    isAvailable: model.toolAvailability["gemini"] == true
+                )
+
                 HStack {
-                    Text("At least one AI reviewer must be enabled. opencode is off by default; it runs the free `opencode/deepseek-v4-flash-free` model at max reasoning effort in a read-only sandbox.")
+                    Text("At least one AI reviewer must be enabled. opencode and Gemini are off by default: opencode runs the free `opencode/deepseek-v4-flash-free` model at max reasoning effort, and Gemini runs headless with a policy that denies every tool but reading — its CLI takes no effort setting.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -436,18 +445,22 @@ private struct ReviewerCard: View {
                 }
                 .disabled(!configuration.enabled)
 
-                HStack {
-                    Text("Effort")
-                        .frame(width: 70, alignment: .leading)
-                    Picker("Effort", selection: $configuration.effort) {
-                        ForEach(efforts) { effort in
-                            Text(effort.label).tag(effort)
+                // A reviewer whose CLI takes no effort flag offers no levels, and
+                // showing an inert picker would promise a control that does nothing.
+                if !efforts.isEmpty {
+                    HStack {
+                        Text("Effort")
+                            .frame(width: 70, alignment: .leading)
+                        Picker("Effort", selection: $configuration.effort) {
+                            ForEach(efforts) { effort in
+                                Text(effort.label).tag(effort)
+                            }
                         }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
+                    .disabled(!configuration.enabled)
                 }
-                .disabled(!configuration.enabled)
 
                 if isSmallModel(configuration.model) {
                     Label(
