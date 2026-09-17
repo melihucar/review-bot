@@ -406,6 +406,40 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(policy.contains("decision = \"deny\""))
     }
 
+    func testAntigravityCLIIsPreferredWhenAgyIsAvailable() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(geminiVerdict: .clean, agyAvailable: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.gemini.enabled = true
+        configuration.gemini.model = "gemini-3.1-pro-high"
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let geminiCount = await runner.geminiCount()
+        let arguments = await runner.geminiInvocation()
+        let executable = await runner.lastGeminiExecutable()
+        XCTAssertEqual(geminiCount, 1)
+        XCTAssertEqual(executable, "agy")
+        XCTAssertEqual(arguments.firstIndex(of: "--model").map { arguments[$0 + 1] }, "gemini-3.1-pro-high")
+        let addDir = arguments.firstIndex(of: "--add-dir").map { arguments[$0 + 1] }
+        XCTAssertEqual(addDir?.hasPrefix(fixture.paths.worktreesDirectory.path), true)
+        // `--mode plan` prepends `/plan`, so the agent outlines a review instead of
+        // writing one — and the parser then reports "returned no verdict".
+        XCTAssertFalse(arguments.contains("--mode"))
+        XCTAssertTrue(arguments.contains("--sandbox"))
+        XCTAssertEqual(arguments.firstIndex(of: "--print-timeout").map { arguments[$0 + 1] }, "15m")
+        XCTAssertEqual(arguments.firstIndex(of: "--output-format").map { arguments[$0 + 1] }, "json")
+        XCTAssertFalse(arguments.contains("--policy"))
+        XCTAssertFalse(arguments.contains("--skip-trust"))
+    }
+
     func testAllThreeReviewersRunInParallelAndPost() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(
@@ -1124,6 +1158,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var opencodeRuns = 0
     private var geminiRuns = 0
     private var geminiArgs: [String] = []
+    private var geminiExecutable = ""
+    private let agyAvailable: Bool
     private var reconciliationRuns = 0
     private var reconciliationPrompt = ""
     private var postedBody = ""
@@ -1183,7 +1219,8 @@ private actor ReviewWorkflowMock: CommandRunning {
         baseCommitsAhead: Int = 0,
         /// What `rev-parse refs/remotes/origin/main` resolves to. `nil` makes it fail the way git
         /// does for an unresolvable ref, which is the only case that may fall back to the snapshot.
-        trackedBaseOid: String? = "trackedbaseoid00"
+        trackedBaseOid: String? = "trackedbaseoid00",
+        agyAvailable: Bool = false
     ) {
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
@@ -1201,6 +1238,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.claudeBody = claudeBody
         self.baseCommitsAhead = baseCommitsAhead
         self.trackedBaseOid = trackedBaseOid
+        self.agyAvailable = agyAvailable
     }
 
     func run(
@@ -1209,6 +1247,12 @@ private actor ReviewWorkflowMock: CommandRunning {
         currentDirectory: URL?,
         timeout: Int
     ) async throws -> CommandResult {
+        if executable == "which" {
+            if arguments == ["agy"], agyAvailable {
+                return result(stdout: "/usr/local/bin/agy\n")
+            }
+            return result(exitCode: 1)
+        }
         if executable == "gh", arguments.starts(with: ["api", "user"]) {
             return result(stdout: "reviewer\n")
         }
@@ -1353,11 +1397,14 @@ private actor ReviewWorkflowMock: CommandRunning {
             opencodeRuns += 1
             return result(stdout: "## Summary\nopencode result.\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
         }
-        if executable == "gemini" {
+        if executable == "gemini" || executable == "agy" {
+            geminiExecutable = executable
             geminiArgs = arguments
-            let prompt = arguments.firstIndex(of: "--prompt").flatMap { index in
-                arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
-            } ?? ""
+            let prompt = ["--prompt", "--print"].compactMap { flag in
+                arguments.firstIndex(of: flag).flatMap { index in
+                    arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
+                }
+            }.first ?? ""
             // Gemini adjudicates only when neither Claude nor Codex is enabled, but the
             // branch has to exist or such a run would be counted as an ordinary review.
             let isReconciliation = prompt.contains("## How to reconcile")
@@ -1406,6 +1453,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func opencodeCount() -> Int { opencodeRuns }
     func geminiCount() -> Int { geminiRuns }
     func geminiInvocation() -> [String] { geminiArgs }
+    func lastGeminiExecutable() -> String { geminiExecutable }
     func reconciliationCount() -> Int { reconciliationRuns }
     func lastReconciliationPrompt() -> String { reconciliationPrompt }
     func lastPostedBody() -> String { postedBody }

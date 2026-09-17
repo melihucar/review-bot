@@ -1297,9 +1297,27 @@ actor ReviewEngine {
             )
         }
         do {
+            let usesAntigravity = await commandExists("agy")
             let result = try await runner.run(
-                "gemini",
-                arguments: [
+                usesAntigravity ? "agy" : "gemini",
+                arguments: usesAntigravity
+                    ? [
+                        "--model", configuration.model,
+                        "--add-dir", worktree.path,
+                        // `--mode plan` is not Gemini's read-only approval mode: it
+                        // prepends `/plan`, so the agent writes an execution outline
+                        // instead of a review and the parser reports "no verdict".
+                        // `--sandbox` still restricts the terminal; the worktree is
+                        // throwaway and removed after the review.
+                        "--sandbox",
+                        "--output-format", "json",
+                        // agy's print-mode default is 5 minutes; the ProcessRunner
+                        // ceiling is 900s, so a long review would otherwise be cut
+                        // off and look like a missing verdict.
+                        "--print-timeout", "15m",
+                        "--prompt", prompt,
+                    ]
+                    : [
                     "--model", configuration.model,
                     "--policy", paths.geminiPolicyFile.path,
                     // The worktree is a scratch checkout the user has never opened,
@@ -1317,12 +1335,15 @@ actor ReviewEngine {
             guard result.succeeded else {
                 return failedReviewer(.gemini, configuration, message: conciseError(result))
             }
-            let output = Self.geminiResponse(result.stdout)
+            let parsed = Self.geminiResponse(result.stdout)
+            if let failure = parsed.failure {
+                return failedReviewer(.gemini, configuration, message: failure)
+            }
             return ReviewerResult(
                 reviewer: .gemini,
                 model: configuration.model,
-                output: output,
-                verdict: VerdictParser.parse(output),
+                output: parsed.text,
+                verdict: VerdictParser.parse(parsed.text),
                 failure: nil
             )
         } catch {
@@ -1368,18 +1389,61 @@ actor ReviewEngine {
         }
     }
 
-    /// `gemini --output-format json` wraps the answer in `{"response": …}`, which
-    /// keeps the reviewer's Markdown clean of the CLI's own chatter. Falls back to
-    /// raw stdout so a build that prints plain text still yields a parsable verdict.
-    static func geminiResponse(_ stdout: String) -> String {
-        struct Payload: Decodable { let response: String }
-        guard let payload = try? JSONDecoder().decode(
-            Payload.self,
-            from: Data(stdout.utf8)
-        ) else {
-            return stdout
+    /// `gemini --output-format json` and `agy --output-format json` wrap the
+    /// answer in `{"response": …}`. agy also reports a terminal `status`; a
+    /// non-SUCCESS envelope is a CLI failure, not a missing `VERDICT:` line.
+    /// Falls back to raw stdout so a build that prints plain text still yields
+    /// a parsable verdict.
+    struct GeminiCLIOutput: Equatable {
+        var text: String
+        var failure: String? = nil
+    }
+
+    static func geminiResponse(_ stdout: String) -> GeminiCLIOutput {
+        struct Payload: Decodable {
+            let response: String?
+            let status: String?
+            let error: String?
         }
-        return payload.response
+
+        func decode(_ raw: String) -> Payload? {
+            try? JSONDecoder().decode(Payload.self, from: Data(raw.utf8))
+        }
+
+        let trimmed = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let payload: Payload?
+        if let direct = decode(trimmed) {
+            payload = direct
+        } else if let start = trimmed.firstIndex(of: "{"),
+                  let end = trimmed.lastIndex(of: "}"),
+                  start < end {
+            payload = decode(String(trimmed[start...end]))
+        } else {
+            payload = nil
+        }
+
+        guard let payload,
+              payload.response != nil || payload.status != nil || payload.error != nil
+        else {
+            return GeminiCLIOutput(text: stdout)
+        }
+
+        if let status = payload.status?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !status.isEmpty,
+           status.uppercased() != "SUCCESS" {
+            let error = payload.error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let message = error.isEmpty ? "Antigravity CLI status \(status)" : error
+            return GeminiCLIOutput(text: payload.response ?? "", failure: message)
+        }
+
+        return GeminiCLIOutput(text: payload.response ?? stdout)
+    }
+
+    /// Personal Gemini Code Assist logins no longer work; Antigravity CLI (`agy`)
+    /// is the replacement when it is on PATH.
+    private func commandExists(_ executable: String) async -> Bool {
+        let result = try? await runner.run("which", arguments: [executable], timeout: 10)
+        return result?.succeeded == true
     }
 
     private func failedReviewer(

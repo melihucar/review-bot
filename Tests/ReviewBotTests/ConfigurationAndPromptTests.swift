@@ -29,7 +29,22 @@ final class ConfigurationAndPromptTests: XCTestCase {
         // Gemini is newer still, and likewise opt-in rather than switched on under
         // an existing user by an upgrade.
         XCTAssertFalse(configuration.gemini.enabled)
-        XCTAssertEqual(configuration.gemini.model, "gemini-3-pro-preview")
+        XCTAssertEqual(configuration.gemini.model, "gemini-3.1-pro-high")
+    }
+
+    func testDefaultGeminiModelIsGemini31ProHigh() {
+        XCTAssertEqual(
+            ReviewBotConfiguration.default.gemini.model,
+            "gemini-3.1-pro-high"
+        )
+    }
+
+    func testGeminiProIsNotFlaggedAsASmallModel() {
+        XCTAssertFalse(ReviewerConfiguration.isSmallOrExperimental("gemini-3.1-pro-high"))
+        XCTAssertFalse(ReviewerConfiguration.isSmallOrExperimental("gemini-3.1-pro-preview"))
+        XCTAssertFalse(ReviewerConfiguration.isSmallOrExperimental("gemini-3-pro-preview"))
+        XCTAssertTrue(ReviewerConfiguration.isSmallOrExperimental("gpt-4o-mini"))
+        XCTAssertTrue(ReviewerConfiguration.isSmallOrExperimental("mimo-v2"))
     }
 
     func testGeminiEffortIsNotClampedBecauseItsCLIHasNone() throws {

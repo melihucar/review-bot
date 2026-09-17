@@ -206,6 +206,39 @@ final class VerdictTests: XCTestCase {
         XCTAssertFalse(result.isWorthRetrying)
     }
 
+    func testGeminiResponseUnwrapsAntigravitySuccessEnvelope() {
+        let stdout = """
+        {"conversation_id":"x","status":"SUCCESS","response":"## Summary\\nOK\\n\\nVERDICT: CLEAN\\n","duration_seconds":1.2}
+        """
+        let parsed = ReviewEngine.geminiResponse(stdout)
+        XCTAssertNil(parsed.failure)
+        XCTAssertEqual(VerdictParser.parse(parsed.text), .clean)
+    }
+
+    func testGeminiResponseTreatsNonSuccessStatusAsFailure() {
+        let stdout = """
+        {"conversation_id":"","status":"ERROR","response":"","error":"invalid model selection","duration_seconds":0}
+        """
+        let parsed = ReviewEngine.geminiResponse(stdout)
+        XCTAssertEqual(parsed.failure, "invalid model selection")
+        XCTAssertTrue(parsed.text.isEmpty)
+    }
+
+    func testGeminiResponseNamesStatusWhenErrorFieldIsMissing() {
+        let stdout = """
+        {"conversation_id":"x","status":"WAITING","response":""}
+        """
+        let parsed = ReviewEngine.geminiResponse(stdout)
+        XCTAssertEqual(parsed.failure, "Antigravity CLI status WAITING")
+    }
+
+    func testGeminiResponseFallsBackToRawStdoutWhenNotJSON() {
+        let stdout = "## Summary\nOK\n\nVERDICT: NITS_ONLY\n"
+        let parsed = ReviewEngine.geminiResponse(stdout)
+        XCTAssertNil(parsed.failure)
+        XCTAssertEqual(VerdictParser.parse(parsed.text), .nitsOnly)
+    }
+
     private func result(
         _ reviewer: ReviewerName,
         verdict: ReviewVerdict?

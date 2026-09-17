@@ -29,7 +29,7 @@ The app stores no GitHub or AI credentials. It uses each developer's existing au
   - `claude`
   - `codex`
   - `opencode` (opt-in reviewer; defaults to the free `opencode/deepseek-v4-flash-free` model at max effort)
-  - `gemini` (opt-in reviewer; defaults to `gemini-3-pro-preview`. Its CLI has no effort setting, so that card has no effort control)
+  - `gemini` (opt-in reviewer; defaults to `gemini-3.1-pro-high`. Prefers Antigravity CLI (`agy`) when it is on PATH, because personal Gemini Code Assist logins no longer work. Its CLI has no effort setting, so that card has no effort control)
 - Local Git repositories with an `origin` remote on `github.com`.
 
 The configured GitHub account needs permission to read the repository and submit pull-request reviews.

@@ -79,7 +79,7 @@ final class AppModel: ObservableObject {
 
     func refreshToolAvailability() async {
         var statuses: [String: Bool] = [:]
-        for tool in ["gh", "claude", "codex", "opencode", "gemini"] {
+        for tool in ["gh", "claude", "codex", "opencode", "gemini", "agy"] {
             let result = try? await runner.run("which", arguments: [tool], timeout: 10)
             statuses[tool] = result?.succeeded == true
         }

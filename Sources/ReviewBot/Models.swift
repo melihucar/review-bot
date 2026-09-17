@@ -46,6 +46,21 @@ struct ReviewerConfiguration: Codable, Equatable {
     var enabled: Bool
     var model: String
     var effort: ReviewEffort
+
+    /// Small/experimental models with measurably weaker resistance to injected
+    /// thread content (see the prompt-injection spike in issue #3).
+    static let smallModelMarkers = ["mimo", "laguna", "lightning", "big-pickle", "hy3", "mini"]
+
+    static func isSmallOrExperimental(_ model: String) -> Bool {
+        let name = model.lowercased()
+        // "gemini" contains the letters "mini", so strip that token before the
+        // mini check; hyphenated mini variants (gpt-4o-mini) still match.
+        let withoutGemini = name.replacingOccurrences(of: "gemini", with: "")
+        return smallModelMarkers.contains { marker in
+            let haystack = marker == "mini" ? withoutGemini : name
+            return haystack.contains(marker)
+        }
+    }
 }
 
 struct RepositoryConfiguration: Codable, Equatable, Identifiable {
@@ -143,7 +158,7 @@ struct ReviewBotConfiguration: Codable, Equatable {
         // effort flag — so it keeps the shared default rather than a meaningful value.
         gemini: ReviewerConfiguration(
             enabled: false,
-            model: "gemini-3-pro-preview",
+            model: "gemini-3.1-pro-high",
             effort: .high
         ),
         customPrompt: "",

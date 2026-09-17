@@ -341,10 +341,11 @@ private struct ReviewersSettingsView: View {
                 ReviewerCard(
                     title: "Gemini",
                     icon: "sparkle.magnifyingglass",
-                    command: "gemini",
+                    command: model.toolAvailability["agy"] == true ? "agy" : "gemini",
                     configuration: $settings.configuration.gemini,
                     efforts: ReviewEffort.geminiCases,
-                    isAvailable: model.toolAvailability["gemini"] == true
+                    isAvailable: model.toolAvailability["agy"] == true
+                        || model.toolAvailability["gemini"] == true
                 )
 
                 HStack {
@@ -417,15 +418,6 @@ private struct ReviewerCard: View {
     let efforts: [ReviewEffort]
     let isAvailable: Bool
 
-    /// Small/experimental models with measurably weaker resistance to injected
-    /// thread content (see the prompt-injection spike in issue #3).
-    private static let smallModelMarkers = ["mimo", "laguna", "lightning", "big-pickle", "hy3", "mini"]
-
-    private func isSmallModel(_ model: String) -> Bool {
-        let name = model.lowercased()
-        return Self.smallModelMarkers.contains { name.contains($0) }
-    }
-
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
@@ -462,7 +454,7 @@ private struct ReviewerCard: View {
                     .disabled(!configuration.enabled)
                 }
 
-                if isSmallModel(configuration.model) {
+                if ReviewerConfiguration.isSmallOrExperimental(configuration.model) {
                     Label(
                         "This model is small or experimental: it measurably degrades under adversarial pull-request content, so Review Bot gates its approvals behind injection checks (and never approves when a `VERDICT:` line appears in the thread or diff).",
                         systemImage: "exclamationmark.triangle"
