@@ -1863,7 +1863,7 @@ private actor ReviewWorkflowMock: CommandRunning {
                 guard let separator = rest.range(of: ":refs/remotes/origin/") else { continue }
                 let name = String(rest[rest.startIndex..<separator.lowerBound])
                 guard name != "main" else { continue }
-                trackingRefs[name] = githubHeadTip
+                trackingRefs[name] = liveHeadBranchTip
             }
             return result()
         }
@@ -2067,6 +2067,19 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastReconciliationPrompt() -> String { reconciliationPrompt }
     func lastPostedBody() -> String { postedBody }
     func lastPostArgument() -> String { postArgument }
+    /// The head branch's real tip as of right now — what a fetch of
+    /// `+refs/heads/<head>:refs/remotes/origin/<head>` writes to the tracking ref.
+    ///
+    /// A push modelled by `headRefOidAfterReview` moves the branch as well as the head
+    /// `gh pr view` reports; the two must not be left disagreeing. The checkout gate resolves
+    /// this tracking ref and aborts when it differs from the reported head, so a mock that
+    /// moved only the reported head would abort every later poll on a head that is in fact
+    /// current. `githubHeadTip` remains the answer before any reviewer has run — which is what
+    /// lets `testHeadMovedBeforeTheReviewStartedAborts…` make the two disagree deliberately.
+    private var liveHeadBranchTip: String {
+        (anyReviewerInvoked ? headRefOidAfterReview : nil) ?? githubHeadTip
+    }
+
     /// Moves the head branch's real tip, as a push landing between two polls would. The
     /// metadata `gh pr view` reports is untouched, so the next poll rediscovers the pull
     /// request under the *same* dedup key and then finds the fetched tip disagreeing with it.
