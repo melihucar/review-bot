@@ -5,6 +5,14 @@ enum ReviewEngineError: LocalizedError {
     case invalidResponse(String)
     case noReviewersEnabled
     case reviewIncomplete(String)
+    /// The pull request's head moved on, so this review is about a commit that no longer
+    /// heads the pull request — either before the checkout, or between the last check and
+    /// the post. Thrown to unwind the review, but **not** a failure: `ReviewEngine.review`
+    /// catches it separately and records a `superseded` event instead of a failed one. Its
+    /// dedup key is keyed to the old head and can never come up again, so counting it
+    /// against the retry budget only pollutes a key nothing will read, while the red
+    /// menu-bar state it produced reported a problem that does not exist.
+    case headMoved(String)
 
     var errorDescription: String? {
         switch self {
@@ -12,6 +20,7 @@ enum ReviewEngineError: LocalizedError {
         case let .invalidResponse(message): message
         case .noReviewersEnabled: "Enable Claude, Codex, or opencode before running reviews."
         case let .reviewIncomplete(message): message
+        case let .headMoved(message): message
         }
     }
 }
@@ -530,13 +539,34 @@ actor ReviewEngine {
                 commitSHA: metadata.headRefOid
             )
 
+            // Never post a review onto a commit it did not read. A review takes minutes, and a
+            // push can land meanwhile: an approval of the old commit may still count toward the
+            // new one's required approvals, so the re-read is the real protection — if the head
+            // moved, post nothing. The request stays open, the next poll discovers the new head
+            // under a fresh dedup key, and this failure count, keyed to the old head, never
+            // matters again. `commit_id` is the backstop for the second or so between the re-read
+            // and the post: GitHub attaches a review that names no commit (all `gh pr review` can
+            // send) to whatever the head is by then, while a pinned one lands on the commit it
+            // describes. GitHub clears the review request on any review, so a review that loses
+            // that race needs a re-request. A head that moves faster than a review completes is
+            // reviewed again each poll — accepted over posting a stale approval.
+            let current = try await pullRequestMetadata(number: pullRequest.number, repository: repository)
+            guard current.headRefOid == metadata.headRefOid else {
+                throw ReviewEngineError.headMoved(
+                    "Not posted — the head moved from \(metadata.headRefOid.prefix(8)) to "
+                        + "\(current.headRefOid.prefix(8)) while the review ran. The next poll "
+                        + "reviews the new head. Saved at \(reviewFile.path)"
+                )
+            }
+
             let post = try await runner.run(
                 "gh",
                 arguments: [
-                    "pr", "review", String(pullRequest.number),
-                    "--repo", repository.githubSlug,
-                    decision.ghArgument,
-                    "--body-file", reviewFile.path,
+                    "api", "--method", "POST",
+                    "repos/\(repository.githubSlug)/pulls/\(pullRequest.number)/reviews",
+                    "-f", "commit_id=\(metadata.headRefOid)",
+                    "-f", "event=\(decision.reviewEvent)",
+                    "-F", "body=@\(reviewFile.path)",
                 ],
                 timeout: 120
             )
@@ -563,6 +593,27 @@ actor ReviewEngine {
                 repository: repository,
                 pullRequest: pullRequest,
                 message: "\(decision.title) — \(verdicts).\(reconciledNote)",
+                onEvent: onEvent
+            )
+        } catch let ReviewEngineError.headMoved(message) {
+            // Not a failure — the expected outcome when a pull request is pushed to while its
+            // review is queued or running. Nothing posted, the dedup key stays unwritten, and
+            // the next poll discovers the new head under its own key and reviews that. So
+            // there is nothing to bound: the retry the budget exists to pace is not happening,
+            // and this key, naming a head that is already history, will never be asked about
+            // again. Counting it would spend a release pull request's whole budget on pushes.
+            //
+            // The count is cleared rather than merely left alone, because the key *can* come
+            // back: a force-push to the head this review was about, with the same
+            // `review_requested` marker behind it, rebuilds the identical key. Earlier
+            // failures against it were real, but they are stale by then — inheriting them
+            // would start that fresh review already part-way through its budget, or past it.
+            attempts.clear(pendingReview.reviewKey, at: now())
+            await emit(
+                kind: .superseded,
+                repository: repository,
+                pullRequest: pullRequest,
+                message: message,
                 onEvent: onEvent
             )
         } catch {
@@ -688,7 +739,7 @@ actor ReviewEngine {
             // so abort before creating the worktree. The old dedup key never recurs and the next
             // discovery keys the new head, so the review is deferred, not lost.
             if let headTip, headTip != metadata.headRefOid {
-                throw ReviewEngineError.reviewIncomplete(
+                throw ReviewEngineError.headMoved(
                     "The head moved from \(metadata.headRefOid.prefix(8)) to \(headTip.prefix(8)) before the review started; the next poll reviews the new head."
                 )
             }

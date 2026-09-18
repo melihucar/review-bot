@@ -849,6 +849,9 @@ final class ReviewEngineFeatureTests: XCTestCase {
     /// The head moved between discovery and the review actually starting — a queued review can sit
     /// for minutes. Reviewing the stale commit would waste the run and post against a commit GitHub
     /// no longer considers current, so the checkout gate aborts instead of proceeding.
+    ///
+    /// It aborts as `superseded`, not as a failure: see
+    /// `testAHeadThatMovedIsNotCountedAsAFailure` for the properties that distinguish the two.
     func testHeadMovedBeforeTheReviewStartedAbortsRatherThanReviewingTheOldCommit() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(githubHeadTip: "fedcba9876543210")
@@ -866,13 +869,104 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let postCount = await runner.postCount()
         XCTAssertEqual(claudeCount, 0)
         XCTAssertEqual(postCount, 0)
-        let failure = events.first(where: { $0.kind == .failed })
-        XCTAssertNotNil(failure)
-        XCTAssertTrue(failure?.message.contains("12345678") ?? false)
-        XCTAssertTrue(failure?.message.contains("fedcba98") ?? false)
+        let superseded = try XCTUnwrap(events.first(where: { $0.kind == .superseded }))
+        XCTAssertTrue(superseded.message.contains("12345678"))
+        XCTAssertTrue(superseded.message.contains("fedcba98"))
         XCTAssertFalse(events.contains(where: {
             [.approved, .changesRequested, .commented].contains($0.kind)
         }))
+    }
+
+    /// A head that moved is an outcome, not a breakage: the review had nothing left to say
+    /// about a commit that no longer heads the pull request. Recording it as a failure spent
+    /// the request's retry budget on ordinary pushes and — because `MenuBarView` reads the
+    /// newest history entry — left the menu bar in its red "Attention" state on a release
+    /// pull request that was behaving exactly as designed.
+    ///
+    /// Both places the head can be found to have moved are checked here: before the checkout
+    /// (`githubHeadTip`) and at the re-read just before posting (`headRefOidAfterReview`).
+    func testAHeadThatMovedIsNotCountedAsAFailure() async throws {
+        let key = "acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z"
+        for runner in [
+            ReviewWorkflowMock(githubHeadTip: "fedcba9876543210"),
+            ReviewWorkflowMock(headRefOidAfterReview: "fedcba9876543210"),
+        ] {
+            let fixture = try FeatureFixture()
+            let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+            let recorder = EventRecorder()
+
+            await engine.poll(
+                configuration: fixture.configuration,
+                onEvent: { entry in await recorder.append(entry) },
+                onStatus: { _ in }
+            )
+
+            let events = await recorder.snapshot()
+            XCTAssertEqual(
+                events.filter { $0.kind == .superseded }.count, 1,
+                "The head moving is reported once, under its own kind"
+            )
+            XCTAssertFalse(
+                events.contains(where: { $0.kind == .failed }),
+                "…and never as a failure, which is what turns the menu bar red"
+            )
+            // `MenuBarView` and `AppModel` both decide the red "Attention" state from the
+            // newest entry alone, so the last word on this review has to be the benign one.
+            XCTAssertEqual(events.last?.kind, .superseded)
+            XCTAssertNil(
+                ReviewAttemptStore(paths: fixture.paths).attempt(for: key),
+                "No attempt is recorded, so the retry budget is untouched"
+            )
+            let message = try XCTUnwrap(events.last?.message)
+            XCTAssertFalse(
+                message.contains("Attempt 1"),
+                "`RetryPolicy.note` counts attempts at a key that, having been superseded, "
+                    + "will not be asked about again"
+            )
+            XCTAssertFalse(
+                ReviewedStateStore(paths: fixture.paths).contains(key),
+                "Nothing was posted, so the dedup key stays unwritten for the next poll"
+            )
+        }
+    }
+
+    /// The same dedup key *can* come back: a force-push returning the head to the commit this
+    /// review was about, with the same `review_requested` marker behind it, rebuilds it exactly.
+    /// Failures recorded against it earlier are stale by then — inheriting them would start the
+    /// fresh review part-way through its budget — so a superseded outcome clears the count.
+    func testASupersededReviewClearsAnEarlierFailureOnTheSameKey() async throws {
+        let key = "acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z"
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failFirstPost: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        // A genuine failure first: the review runs, and GitHub rejects the post.
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+        XCTAssertEqual(
+            ReviewAttemptStore(paths: fixture.paths).attempt(for: key)?.failures, 1,
+            "A rejected post is a real failure and is counted"
+        )
+
+        // Now the head branch moves, while `gh pr view` still reports the commit the failure
+        // was recorded against — so the next poll rediscovers this very key.
+        await runner.moveHeadBranch(to: "fedcba9876543210")
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        XCTAssertEqual(events.last?.kind, .superseded)
+        XCTAssertNil(
+            ReviewAttemptStore(paths: fixture.paths).attempt(for: key),
+            "The stale failure count must not carry into a review of the same key"
+        )
     }
 
     /// A fork's head branch is never fetched by name: it does not live on `origin`, where the same
@@ -1381,6 +1475,138 @@ final class ReviewEngineFeatureTests: XCTestCase {
             "A posted review should forget the earlier failure"
         )
     }
+
+    /// `gh pr review` cannot name a commit, so GitHub would attach an unpinned review to
+    /// whatever the pull request's head happens to be by the time it is submitted — not the
+    /// commit the reviewers actually read. The review is submitted through the reviews API
+    /// pinned to that commit with `commit_id` instead.
+    func testAReviewIsPinnedToTheCommitItReviewed() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+
+        await engine.poll(configuration: fixture.configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let postedCommitId = await runner.lastPostedCommitId()
+        let postArgument = await runner.lastPostArgument()
+        let commands = await runner.commands()
+        let bodyFlag = await runner.lastBodyFlag()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(postedCommitId, "1234567890abcdef")
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertEqual(bodyFlag, "-F", "only -F reads the review file; -f would post its path")
+        XCTAssertTrue(postedBody.contains("## Automated review — PR #42"))
+
+        // The head is re-read (a `gh pr view … --json` call) after the reviewer ran and
+        // before the review is posted through the reviews API.
+        let metadataIndex = try XCTUnwrap(
+            commands.lastIndex(where: { $0.first == "gh" && $0.contains("--json") }),
+            "Expected a metadata re-read before posting"
+        )
+        let claudeIndex = try XCTUnwrap(
+            commands.firstIndex(where: { $0.first == "claude" }),
+            "Expected the reviewer to have run"
+        )
+        let postIndex = try XCTUnwrap(
+            commands.firstIndex(where: { $0.starts(with: ["gh", "api", "--method", "POST"]) }),
+            "Expected the pinned post"
+        )
+        XCTAssertGreaterThan(metadataIndex, claudeIndex, "The head is re-read after the reviewer ran")
+        XCTAssertLessThan(metadataIndex, postIndex, "…and before the review is posted")
+    }
+
+    /// A review takes minutes; a push landing while it runs must not have the resulting
+    /// approval attached to it. The head is re-read right before posting, and a mismatch
+    /// against the head the reviewers actually read posts nothing — as a `superseded`
+    /// outcome, since nothing went wrong and the next poll reviews the new commit.
+    func testAReviewIsNotPostedWhenTheHeadMovedDuringTheReview() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(headRefOidAfterReview: "fedcba9876543210")
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        var events = await recorder.snapshot()
+        var postCount = await runner.postCount()
+        XCTAssertEqual(postCount, 0, "Nothing is posted once the head has moved")
+        // Reported as `superseded` rather than `failed` — the review did its work, the commit
+        // it did it for simply stopped being the head. See `testAHeadThatMovedIsNotCountedAsAFailure`.
+        let supersededEvents = events.filter { $0.kind == .superseded }
+        XCTAssertEqual(supersededEvents.count, 1)
+        XCTAssertEqual(events.filter { $0.kind == .failed }.count, 0)
+        let supersededMessage = try XCTUnwrap(supersededEvents.first?.message)
+        XCTAssertTrue(supersededMessage.contains("12345678"))
+        XCTAssertTrue(supersededMessage.contains("fedcba98"))
+        XCTAssertFalse(events.contains(where: {
+            [.approved, .commented, .changesRequested].contains($0.kind)
+        }))
+        XCTAssertFalse(
+            ReviewedStateStore(paths: fixture.paths)
+                .contains("acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z"),
+            "The stale dedup key must never be recorded — nothing was posted against it"
+        )
+        XCTAssertNil(
+            LastReviewedStore(paths: fixture.paths).head(for: "acme/widget#42"),
+            "No head was ever successfully reviewed and posted"
+        )
+
+        // The next poll discovers the moved head fresh, under its own dedup key, and posts.
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        events = await recorder.snapshot()
+        postCount = await runner.postCount()
+        let postedCommitId = await runner.lastPostedCommitId()
+        XCTAssertEqual(postCount, 1)
+        XCTAssertEqual(postedCommitId, "fedcba9876543210")
+        XCTAssertTrue(events.contains(where: { $0.kind == .approved }))
+    }
+
+    /// The re-read itself can fail (a rate limit, a network blip). Nothing is posted on an
+    /// unverified head — and unlike a head that is known to have moved, this *is* a failure:
+    /// the head may well be unchanged, so the same key is worth retrying, under the budget
+    /// that stops a permanently broken re-read from re-running the pipeline forever.
+    func testAFailedHeadRecheckPostsNothing() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failHeadRecheck: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let postCount = await runner.postCount()
+        let events = await recorder.snapshot()
+        XCTAssertEqual(postCount, 0)
+        let failure = try XCTUnwrap(events.first(where: { $0.kind == .failed }))
+        XCTAssertTrue(failure.message.contains("simulated head recheck failure"))
+        XCTAssertFalse(
+            events.contains(where: { $0.kind == .superseded }),
+            "An unreadable head is not a head that moved"
+        )
+        XCTAssertEqual(
+            ReviewAttemptStore(paths: fixture.paths)
+                .attempt(for: "acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z")?.failures,
+            1,
+            "…so it is counted, and the retry is bounded like any other failure"
+        )
+        XCTAssertFalse(
+            ReviewedStateStore(paths: fixture.paths)
+                .contains("acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z"),
+            "an unverified head is never recorded as reviewed"
+        )
+    }
 }
 
 /// A clock the tests move by hand, so backoff windows don't depend on wall time.
@@ -1457,11 +1683,18 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var reconciliationPrompt = ""
     private var postedBody = ""
     private var postArgument = ""
+    private var postedCommitIds: [String] = []
+    private var bodyFlag: String?
     private var claudePrompt = ""
     private var preparedDiffSeen = false
     private var ghPrDiffCalled = false
     private var timelineCalls = 0
     private var incrementalDiffArgs: [String]?
+    private var commandLog: [[String]] = []
+    /// Flips true once any ordinary reviewer (claude in its non-reconciliation role, codex,
+    /// or opencode) has been invoked — used to make the `gh pr view --json` head answer
+    /// change partway through a review, the way a real push would.
+    private var anyReviewerInvoked = false
     /// The merge preview as the reviewer saw it, captured at the moment `claude` was invoked —
     /// non-`nil` only when the file was actually present in the worktree by then.
     private var mergePreviewText: String?
@@ -1483,7 +1716,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let trackedBaseOid: String?
     private let headRefName: String?
     private let isCrossRepository: Bool?
-    private let githubHeadTip: String
+    /// Mutable so a test can move the head branch between polls — see `moveHeadBranch(to:)`.
+    private var githubHeadTip: String
     private let failHeadRevParse: Bool
     private let baseTreeDiffExitCode: Int32
 
@@ -1500,6 +1734,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// Seeded with a pre-existing (stale) value so a test can prove the fetch overwrites it before
     /// anything reads it back.
     private var trackingRefs: [String: String]
+    private let headRefOidAfterReview: String?
+    private let failHeadRecheck: Bool
     private var baseTreeDiffArgs: [String]?
     private var mergeTreeCalls = 0
 
@@ -1545,6 +1781,13 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// Makes the checkout gate's post-fetch `rev-parse` of the head branch fail, modelling a
         /// read-back that could not resolve the ref it had just fetched.
         failHeadRevParse: Bool = false,
+        /// The head `gh pr view --json` reports once a reviewer has run, simulating a push that
+        /// landed while the review was in flight. `nil` — the default — keeps answering the
+        /// original head for the whole review, as a PR whose head never moves would.
+        headRefOidAfterReview: String? = nil,
+        /// Once a reviewer has run, every later `gh pr view --json` fails — the pre-post head
+        /// re-read, and discovery on any later poll.
+        failHeadRecheck: Bool = false,
         /// Exit code for the `git diff --quiet --no-ext-diff <mergeBase> <base>` content probe.
         /// `1` — the default — is "the base changed content", which is what every merge-preview
         /// test before this one already assumes, so it keeps their behaviour unchanged. `0` is
@@ -1567,6 +1810,8 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.opencodeBody = opencodeBody
         self.baseCommitsAhead = baseCommitsAhead
         self.trackedBaseOid = trackedBaseOid
+        self.headRefOidAfterReview = headRefOidAfterReview
+        self.failHeadRecheck = failHeadRecheck
         self.headRefName = headRefName
         self.isCrossRepository = isCrossRepository
         self.githubHeadTip = githubHeadTip
@@ -1585,6 +1830,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         currentDirectory: URL?,
         timeout: Int
     ) async throws -> CommandResult {
+        commandLog.append([executable] + arguments)
         if executable == "gh", arguments.starts(with: ["api", "user"]) {
             return result(stdout: "reviewer\n")
         }
@@ -1593,7 +1839,12 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "gh", arguments.starts(with: ["pr", "view", "42"]),
            arguments.contains("--json") {
-            return result(stdout: pullRequestMetadataJSON())
+            if anyReviewerInvoked, failHeadRecheck {
+                return result(exitCode: 1, stderr: "simulated head recheck failure")
+            }
+            return result(stdout: pullRequestMetadataJSON(
+                headRefOid: (anyReviewerInvoked ? headRefOidAfterReview : nil) ?? "1234567890abcdef"
+            ))
         }
         if executable == "gh", arguments.contains("repos/acme/widget/issues/42/timeline") {
             timelineCalls += 1
@@ -1612,7 +1863,7 @@ private actor ReviewWorkflowMock: CommandRunning {
                 guard let separator = rest.range(of: ":refs/remotes/origin/") else { continue }
                 let name = String(rest[rest.startIndex..<separator.lowerBound])
                 guard name != "main" else { continue }
-                trackingRefs[name] = githubHeadTip
+                trackingRefs[name] = liveHeadBranchTip
             }
             return result()
         }
@@ -1703,6 +1954,40 @@ private actor ReviewWorkflowMock: CommandRunning {
            arguments.contains("--comments") {
             return result(stdout: conversationText)
         }
+        // Must precede the GET branch just below for the same path — otherwise it would
+        // swallow the post and `posts`/`postedCommitIds` would never see it.
+        if executable == "gh", arguments.starts(with: ["api", "--method", "POST"]),
+           arguments.contains("repos/acme/widget/pulls/42/reviews") {
+            posts += 1
+            for (index, argument) in arguments.enumerated() where ["-f", "-F"].contains(argument) {
+                guard arguments.indices.contains(index + 1) else { continue }
+                let value = arguments[index + 1]
+                if value.hasPrefix("commit_id=") {
+                    postedCommitIds.append(String(value.dropFirst("commit_id=".count)))
+                } else if value.hasPrefix("event=") {
+                    let event = String(value.dropFirst("event=".count))
+                    postArgument = [
+                        "APPROVE": "--approve",
+                        "REQUEST_CHANGES": "--request-changes",
+                        "COMMENT": "--comment",
+                    ][event] ?? ""
+                } else if value.hasPrefix("body=@") {
+                    // Only `-F` reads the file; `-f` would send the literal `@<path>` — the
+                    // local path — as the public review body. Record which flag carried it.
+                    bodyFlag = argument
+                    if argument == "-F" {
+                        let path = String(value.dropFirst("body=@".count))
+                        postedBody = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+                    } else {
+                        postedBody = value
+                    }
+                }
+            }
+            if failFirstPost, posts == 1 {
+                return result(exitCode: 1, stderr: "simulated post failure")
+            }
+            return result()
+        }
         if executable == "gh", arguments.contains("repos/acme/widget/pulls/42/reviews") {
             return result(stdout: "No prior reviews")
         }
@@ -1725,6 +2010,7 @@ private actor ReviewWorkflowMock: CommandRunning {
                 return result(stdout: "## Reconciliation\nRe-checked findings.\n\nVERDICT: \(verdict.rawValue)\n")
             }
             claudeRuns += 1
+            anyReviewerInvoked = true
             claudePrompt = prompt
             if let currentDirectory {
                 preparedDiffSeen = FileManager.default.fileExists(
@@ -1739,6 +2025,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "codex" {
             codexRuns += 1
+            anyReviewerInvoked = true
             if codexTimesOut {
                 throw CommandExecutionError.timedOut(command: "codex", seconds: 900)
             }
@@ -1757,21 +2044,8 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "opencode" {
             opencodeRuns += 1
+            anyReviewerInvoked = true
             return result(stdout: "## Summary\n\(opencodeBody)\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
-        }
-        if executable == "gh", arguments.starts(with: ["pr", "review", "42"]) {
-            posts += 1
-            postArgument = arguments.first(where: {
-                ["--approve", "--request-changes", "--comment"].contains($0)
-            }) ?? ""
-            if let bodyIndex = arguments.firstIndex(of: "--body-file"),
-               arguments.indices.contains(bodyIndex + 1) {
-                postedBody = (try? String(contentsOfFile: arguments[bodyIndex + 1], encoding: .utf8)) ?? ""
-            }
-            if failFirstPost, posts == 1 {
-                return result(exitCode: 1, stderr: "simulated post failure")
-            }
-            return result()
         }
         if executable == "git", arguments.contains("remove") {
             return result()
@@ -1793,6 +2067,27 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastReconciliationPrompt() -> String { reconciliationPrompt }
     func lastPostedBody() -> String { postedBody }
     func lastPostArgument() -> String { postArgument }
+    /// The head branch's real tip as of right now — what a fetch of
+    /// `+refs/heads/<head>:refs/remotes/origin/<head>` writes to the tracking ref.
+    ///
+    /// A push modelled by `headRefOidAfterReview` moves the branch as well as the head
+    /// `gh pr view` reports; the two must not be left disagreeing. The checkout gate resolves
+    /// this tracking ref and aborts when it differs from the reported head, so a mock that
+    /// moved only the reported head would abort every later poll on a head that is in fact
+    /// current. `githubHeadTip` remains the answer before any reviewer has run — which is what
+    /// lets `testHeadMovedBeforeTheReviewStartedAborts…` make the two disagree deliberately.
+    private var liveHeadBranchTip: String {
+        (anyReviewerInvoked ? headRefOidAfterReview : nil) ?? githubHeadTip
+    }
+
+    /// Moves the head branch's real tip, as a push landing between two polls would. The
+    /// metadata `gh pr view` reports is untouched, so the next poll rediscovers the pull
+    /// request under the *same* dedup key and then finds the fetched tip disagreeing with it.
+    func moveHeadBranch(to oid: String) { githubHeadTip = oid }
+
+    func lastPostedCommitId() -> String? { postedCommitIds.last }
+    func lastBodyFlag() -> String? { bodyFlag }
+    func commands() -> [[String]] { commandLog }
     func lastClaudePrompt() -> String { claudePrompt }
     func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
     func mergePreviewDuringReview() -> String? { mergePreviewText }
@@ -1815,10 +2110,10 @@ private actor ReviewWorkflowMock: CommandRunning {
 
     /// The `gh pr view --json` response, omitting `headRefName`/`isCrossRepository` when their
     /// value is `nil` — a response missing those keys must still decode.
-    private func pullRequestMetadataJSON() -> String {
+    private func pullRequestMetadataJSON(headRefOid: String = "1234567890abcdef") -> String {
         var fields: [String: Any] = [
             "title": "Improve widgets",
-            "headRefOid": "1234567890abcdef",
+            "headRefOid": headRefOid,
             "baseRefName": "main",
             "baseRefOid": "abcdef1234567890",
             "url": "https://github.com/acme/widget/pull/42",

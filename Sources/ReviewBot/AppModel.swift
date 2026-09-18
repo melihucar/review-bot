@@ -211,7 +211,9 @@ final class AppModel: ObservableObject {
             pendingReviews.removeAll(where: { $0.id == item.id })
             runningReviews.removeAll(where: { $0.id == item.id })
             runningReviews.append(item)
-        case .approved, .changesRequested, .commented, .failed:
+        // `superseded` ends this review like any other terminal event. The next poll
+        // rediscovers the pull request at its new head and queues it again from scratch.
+        case .approved, .changesRequested, .commented, .failed, .superseded:
             pendingReviews.removeAll(where: { $0.id == item.id })
             runningReviews.removeAll(where: { $0.id == item.id })
         }
