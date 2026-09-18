@@ -20,6 +20,20 @@ private func withoutPromptModelAndEffort(_ arguments: [String]) -> [String] {
 }
 
 final class ReviewEngineFeatureTests: XCTestCase {
+    func testCodexReviewLongerThanFifteenMinutesCanComplete() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(codexRequiredSeconds: 974)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = true
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+        let posts = await runner.postCount()
+        let runs = await runner.codexCount()
+        XCTAssertEqual(posts, 1, "A completed 16-minute Codex review must not be discarded at 15 minutes")
+        XCTAssertEqual(runs, 1)
+    }
+
     func testCleanReviewRunsInWorktreeUsesRepositoryRulesAndPostsApproval() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock()
@@ -1915,6 +1929,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let failClaude: Bool
     private let claudeFailureMessage: String
     private let codexFailuresBeforeSuccess: Int
+    private let codexRequiredSeconds: Int
     private let codexTimesOut: Bool
     private let failTimeline: Bool
     private let emptyTimeline: Bool
@@ -1968,6 +1983,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         claudeFailureMessage: String = "simulated claude failure",
         codexFailuresBeforeSuccess: Int = 0,
         codexTimesOut: Bool = false,
+        codexRequiredSeconds: Int = 0,
         failTimeline: Bool = false,
         emptyTimeline: Bool = false,
         conversationText: String = "PR conversation",
@@ -2032,6 +2048,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.failClaude = failClaude
         self.claudeFailureMessage = claudeFailureMessage
         self.codexFailuresBeforeSuccess = codexFailuresBeforeSuccess
+        self.codexRequiredSeconds = codexRequiredSeconds
         self.codexTimesOut = codexTimesOut
         self.failTimeline = failTimeline
         self.emptyTimeline = emptyTimeline
@@ -2300,8 +2317,8 @@ private actor ReviewWorkflowMock: CommandRunning {
         if executable == "codex" {
             codexRuns += 1
             anyReviewerInvoked = true
-            if codexTimesOut {
-                throw CommandExecutionError.timedOut(command: "codex", seconds: 900)
+            if codexTimesOut || timeout < codexRequiredSeconds {
+                throw CommandExecutionError.timedOut(command: "codex", seconds: timeout)
             }
             if failCodex || codexRuns <= codexFailuresBeforeSuccess {
                 return result(exitCode: 1, stderr: codexFailureMessage)

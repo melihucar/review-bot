@@ -11,6 +11,11 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Fixed
+
+- Enforce command deadlines in a separate supervisor and stop the timed-out command's process group, including launcher children and helpers, without interrupting other concurrent reviews. Child programs can no longer cancel the runner deadline by resetting an inherited alarm.
+- Allow up to 30 minutes for Codex reviews; high-effort reviews that complete just beyond 15 minutes were previously discarded.
+
 ## [0.3.0] - 2026-09-18
 
 ### Added

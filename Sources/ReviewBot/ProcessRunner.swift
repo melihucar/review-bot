@@ -71,6 +71,51 @@ enum CommandExecutionError: LocalizedError {
 }
 
 struct ProcessRunner: CommandRunning {
+    // Keep the deadline in a supervisor: exec'ing a launcher only times out the launcher,
+    // and an exec'ed program can cancel an inherited alarm. Each invocation owns a process
+    // group so timeout cleanup also reaches reviewer binaries and their helper processes.
+    private static let supervisedCommand = #"""
+    use POSIX qw(setpgid);
+    my $timeout = shift @ARGV;
+    my $pid = fork();
+    defined $pid or die "fork failed: $!";
+    if ($pid == 0) {
+        setpgid(0, 0) == 0 or die "setpgid failed: $!";
+        exec @ARGV;
+        exit 127;
+    }
+    setpgid($pid, $pid);
+    my $stop = sub {
+        my ($signal) = @_;
+        alarm 0;
+        kill 'TERM', -$pid;
+        select undef, undef, undef, 0.2;
+        kill 'KILL', -$pid;
+        # Also cover a child that has not reached setpgid yet.
+        kill 'KILL', $pid;
+        waitpid($pid, 0);
+        $SIG{$signal} = 'DEFAULT';
+        kill $signal, $$;
+        exit 125;
+    };
+    $SIG{ALRM} = sub { $stop->('ALRM') };
+    $SIG{TERM} = sub { $stop->('TERM') };
+    $SIG{INT} = sub { $stop->('INT') };
+    $SIG{HUP} = sub { $stop->('HUP') };
+    alarm $timeout;
+    my $waited;
+    do { $waited = waitpid($pid, 0) } while ($waited == -1 && $!{EINTR});
+    my $status = $?;
+    alarm 0;
+    exit 127 if $waited == -1;
+    if (my $signal = $status & 127) {
+        $SIG{$_} = 'DEFAULT' for qw(ALRM TERM INT HUP);
+        kill $signal, $$;
+        exit 125;
+    }
+    exit($status >> 8);
+    """#
+
     private let fileManager = FileManager.default
 
     /// The `PATH` every spawned command inherits. A Finder- or launch-at-login-started app
@@ -255,7 +300,7 @@ struct ProcessRunner: CommandRunning {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
         process.arguments = [
             "-e",
-            "alarm shift @ARGV; exec @ARGV or exit 127",
+            Self.supervisedCommand,
             String(timeout),
             "/usr/bin/env",
             executable,
