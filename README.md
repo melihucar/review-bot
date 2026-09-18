@@ -125,7 +125,9 @@ Generated reviews clearly identify each reviewer and preserve their findings in 
 10. Otherwise aggregate the verdicts and save the Markdown, then re-read the pull request's head; if it moved since discovery, post nothing so the next poll reviews the new commit instead.
 11. Submit the decision through GitHub's pull request reviews API (`gh api`), pinned to the reviewed commit. Mark the request completed only after GitHub accepts it, then remove the worktree.
 
-If submission fails, the request is not marked complete and will be retried during a later poll.
+If submission fails, the request is not marked complete and will be retried during a later poll, under a bounded number of attempts.
+
+A head that moved (step 4 or step 10) is recorded as "Head moved" rather than as a failure: nothing is wrong, so it spends none of those attempts and does not put the menu bar into its red "Attention" state. The next poll reviews the new commit.
 
 ## Local data
 

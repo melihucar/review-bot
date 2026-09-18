@@ -757,6 +757,9 @@ final class ReviewEngineFeatureTests: XCTestCase {
     /// The head moved between discovery and the review actually starting — a queued review can sit
     /// for minutes. Reviewing the stale commit would waste the run and post against a commit GitHub
     /// no longer considers current, so the checkout gate aborts instead of proceeding.
+    ///
+    /// It aborts as `superseded`, not as a failure: see
+    /// `testAHeadThatMovedIsNotCountedAsAFailure` for the properties that distinguish the two.
     func testHeadMovedBeforeTheReviewStartedAbortsRatherThanReviewingTheOldCommit() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(githubHeadTip: "fedcba9876543210")
@@ -774,13 +777,104 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let postCount = await runner.postCount()
         XCTAssertEqual(claudeCount, 0)
         XCTAssertEqual(postCount, 0)
-        let failure = events.first(where: { $0.kind == .failed })
-        XCTAssertNotNil(failure)
-        XCTAssertTrue(failure?.message.contains("12345678") ?? false)
-        XCTAssertTrue(failure?.message.contains("fedcba98") ?? false)
+        let superseded = try XCTUnwrap(events.first(where: { $0.kind == .superseded }))
+        XCTAssertTrue(superseded.message.contains("12345678"))
+        XCTAssertTrue(superseded.message.contains("fedcba98"))
         XCTAssertFalse(events.contains(where: {
             [.approved, .changesRequested, .commented].contains($0.kind)
         }))
+    }
+
+    /// A head that moved is an outcome, not a breakage: the review had nothing left to say
+    /// about a commit that no longer heads the pull request. Recording it as a failure spent
+    /// the request's retry budget on ordinary pushes and — because `MenuBarView` reads the
+    /// newest history entry — left the menu bar in its red "Attention" state on a release
+    /// pull request that was behaving exactly as designed.
+    ///
+    /// Both places the head can be found to have moved are checked here: before the checkout
+    /// (`githubHeadTip`) and at the re-read just before posting (`headRefOidAfterReview`).
+    func testAHeadThatMovedIsNotCountedAsAFailure() async throws {
+        let key = "acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z"
+        for runner in [
+            ReviewWorkflowMock(githubHeadTip: "fedcba9876543210"),
+            ReviewWorkflowMock(headRefOidAfterReview: "fedcba9876543210"),
+        ] {
+            let fixture = try FeatureFixture()
+            let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+            let recorder = EventRecorder()
+
+            await engine.poll(
+                configuration: fixture.configuration,
+                onEvent: { entry in await recorder.append(entry) },
+                onStatus: { _ in }
+            )
+
+            let events = await recorder.snapshot()
+            XCTAssertEqual(
+                events.filter { $0.kind == .superseded }.count, 1,
+                "The head moving is reported once, under its own kind"
+            )
+            XCTAssertFalse(
+                events.contains(where: { $0.kind == .failed }),
+                "…and never as a failure, which is what turns the menu bar red"
+            )
+            // `MenuBarView` and `AppModel` both decide the red "Attention" state from the
+            // newest entry alone, so the last word on this review has to be the benign one.
+            XCTAssertEqual(events.last?.kind, .superseded)
+            XCTAssertNil(
+                ReviewAttemptStore(paths: fixture.paths).attempt(for: key),
+                "No attempt is recorded, so the retry budget is untouched"
+            )
+            let message = try XCTUnwrap(events.last?.message)
+            XCTAssertFalse(
+                message.contains("Attempt 1"),
+                "`RetryPolicy.note` counts attempts at a key that, having been superseded, "
+                    + "will not be asked about again"
+            )
+            XCTAssertFalse(
+                ReviewedStateStore(paths: fixture.paths).contains(key),
+                "Nothing was posted, so the dedup key stays unwritten for the next poll"
+            )
+        }
+    }
+
+    /// The same dedup key *can* come back: a force-push returning the head to the commit this
+    /// review was about, with the same `review_requested` marker behind it, rebuilds it exactly.
+    /// Failures recorded against it earlier are stale by then — inheriting them would start the
+    /// fresh review part-way through its budget — so a superseded outcome clears the count.
+    func testASupersededReviewClearsAnEarlierFailureOnTheSameKey() async throws {
+        let key = "acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z"
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failFirstPost: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        // A genuine failure first: the review runs, and GitHub rejects the post.
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+        XCTAssertEqual(
+            ReviewAttemptStore(paths: fixture.paths).attempt(for: key)?.failures, 1,
+            "A rejected post is a real failure and is counted"
+        )
+
+        // Now the head branch moves, while `gh pr view` still reports the commit the failure
+        // was recorded against — so the next poll rediscovers this very key.
+        await runner.moveHeadBranch(to: "fedcba9876543210")
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        XCTAssertEqual(events.last?.kind, .superseded)
+        XCTAssertNil(
+            ReviewAttemptStore(paths: fixture.paths).attempt(for: key),
+            "The stale failure count must not carry into a review of the same key"
+        )
     }
 
     /// A fork's head branch is never fetched by name: it does not live on `origin`, where the same
@@ -1237,7 +1331,8 @@ final class ReviewEngineFeatureTests: XCTestCase {
 
     /// A review takes minutes; a push landing while it runs must not have the resulting
     /// approval attached to it. The head is re-read right before posting, and a mismatch
-    /// against the head the reviewers actually read posts nothing.
+    /// against the head the reviewers actually read posts nothing — as a `superseded`
+    /// outcome, since nothing went wrong and the next poll reviews the new commit.
     func testAReviewIsNotPostedWhenTheHeadMovedDuringTheReview() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(headRefOidAfterReview: "fedcba9876543210")
@@ -1253,11 +1348,14 @@ final class ReviewEngineFeatureTests: XCTestCase {
         var events = await recorder.snapshot()
         var postCount = await runner.postCount()
         XCTAssertEqual(postCount, 0, "Nothing is posted once the head has moved")
-        let failedEvents = events.filter { $0.kind == .failed }
-        XCTAssertEqual(failedEvents.count, 1)
-        let failureMessage = try XCTUnwrap(failedEvents.first?.message)
-        XCTAssertTrue(failureMessage.contains("12345678"))
-        XCTAssertTrue(failureMessage.contains("fedcba98"))
+        // Reported as `superseded` rather than `failed` — the review did its work, the commit
+        // it did it for simply stopped being the head. See `testAHeadThatMovedIsNotCountedAsAFailure`.
+        let supersededEvents = events.filter { $0.kind == .superseded }
+        XCTAssertEqual(supersededEvents.count, 1)
+        XCTAssertEqual(events.filter { $0.kind == .failed }.count, 0)
+        let supersededMessage = try XCTUnwrap(supersededEvents.first?.message)
+        XCTAssertTrue(supersededMessage.contains("12345678"))
+        XCTAssertTrue(supersededMessage.contains("fedcba98"))
         XCTAssertFalse(events.contains(where: {
             [.approved, .commented, .changesRequested].contains($0.kind)
         }))
@@ -1287,7 +1385,9 @@ final class ReviewEngineFeatureTests: XCTestCase {
     }
 
     /// The re-read itself can fail (a rate limit, a network blip). Nothing is posted on an
-    /// unverified head — the failure is counted and retried like any other.
+    /// unverified head — and unlike a head that is known to have moved, this *is* a failure:
+    /// the head may well be unchanged, so the same key is worth retrying, under the budget
+    /// that stops a permanently broken re-read from re-running the pipeline forever.
     func testAFailedHeadRecheckPostsNothing() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(failHeadRecheck: true)
@@ -1305,6 +1405,16 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(postCount, 0)
         let failure = try XCTUnwrap(events.first(where: { $0.kind == .failed }))
         XCTAssertTrue(failure.message.contains("simulated head recheck failure"))
+        XCTAssertFalse(
+            events.contains(where: { $0.kind == .superseded }),
+            "An unreadable head is not a head that moved"
+        )
+        XCTAssertEqual(
+            ReviewAttemptStore(paths: fixture.paths)
+                .attempt(for: "acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z")?.failures,
+            1,
+            "…so it is counted, and the retry is bounded like any other failure"
+        )
         XCTAssertFalse(
             ReviewedStateStore(paths: fixture.paths)
                 .contains("acme/widget#42@1234567890abcdef@2026-07-15T10:00:00Z"),
@@ -1416,7 +1526,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let trackedBaseOid: String?
     private let headRefName: String?
     private let isCrossRepository: Bool?
-    private let githubHeadTip: String
+    /// Mutable so a test can move the head branch between polls — see `moveHeadBranch(to:)`.
+    private var githubHeadTip: String
     private let failHeadRevParse: Bool
 
     /// The base ref OID GitHub reports in `gh pr view`. Kept as a constant because the mock's
@@ -1746,6 +1857,11 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastReconciliationPrompt() -> String { reconciliationPrompt }
     func lastPostedBody() -> String { postedBody }
     func lastPostArgument() -> String { postArgument }
+    /// Moves the head branch's real tip, as a push landing between two polls would. The
+    /// metadata `gh pr view` reports is untouched, so the next poll rediscovers the pull
+    /// request under the *same* dedup key and then finds the fetched tip disagreeing with it.
+    func moveHeadBranch(to oid: String) { githubHeadTip = oid }
+
     func lastPostedCommitId() -> String? { postedCommitIds.last }
     func lastBodyFlag() -> String? { bodyFlag }
     func commands() -> [[String]] { commandLog }

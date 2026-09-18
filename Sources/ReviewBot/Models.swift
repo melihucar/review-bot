@@ -252,6 +252,15 @@ enum HistoryEventKind: String, Codable {
     case changesRequested
     case commented
     case failed
+    /// The pull request's head moved on before the review could be posted, so this attempt
+    /// had nothing left to say about a commit anyone still cares about — the next poll
+    /// reviews the new head.
+    ///
+    /// Deliberately not `failed`. Nothing is broken on that path: no retry budget is spent,
+    /// and the menu bar stays out of its red "Attention" state. A release pull request whose
+    /// head moves often would otherwise show red on every poll while behaving exactly as
+    /// designed, which trains the developer to ignore the one signal that means something.
+    case superseded
 
     var label: String {
         switch self {
@@ -261,6 +270,7 @@ enum HistoryEventKind: String, Codable {
         case .changesRequested: "Changes requested"
         case .commented: "Comment posted"
         case .failed: "Failed"
+        case .superseded: "Head moved"
         }
     }
 
@@ -272,6 +282,7 @@ enum HistoryEventKind: String, Codable {
         case .changesRequested: "exclamationmark.octagon.fill"
         case .commented: "text.bubble.fill"
         case .failed: "xmark.circle.fill"
+        case .superseded: "arrow.triangle.branch"
         }
     }
 }

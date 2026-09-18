@@ -299,6 +299,8 @@ extension HistoryEventKind {
         case .changesRequested: .orange
         case .commented: .purple
         case .failed: .red
+        // Deliberately inert: a head that moved is an outcome, not a problem.
+        case .superseded: .secondary
         }
     }
 }

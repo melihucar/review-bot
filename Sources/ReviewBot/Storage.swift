@@ -93,6 +93,44 @@ final class SettingsStore: ObservableObject {
     }
 }
 
+/// History that survives an entry it cannot read.
+///
+/// `HistoryEventKind` gains cases over time — `superseded` is the most recent — and
+/// `HistoryStore` rewrites the whole file on every append. So a build reading a file that a
+/// newer build wrote will meet a raw value it has no case for, which is exactly what happens
+/// when someone reinstalls an older release. `decode([HistoryEntry].self)` is all-or-nothing
+/// there: the one unreadable entry throws, the `try?` at the call site turns that into no
+/// history at all, and up to 2,000 entries disappear because one of them named a kind this
+/// build predates. Decoding element by element costs that one entry instead.
+///
+/// This cannot rescue releases that already shipped without it — nothing can — but it makes
+/// `superseded`, and every case added after it, safe to read from either direction.
+private struct LenientHistory: Decodable {
+    let entries: [HistoryEntry]
+
+    /// Decodes anything and keeps none of it. An unkeyed container does not step past an
+    /// element whose decode threw, so the slot has to be consumed some other way.
+    private struct AnyElement: Decodable {
+        init(from decoder: Decoder) throws {}
+    }
+
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var decoded: [HistoryEntry] = []
+        while !container.isAtEnd {
+            let index = container.currentIndex
+            if let entry = try? container.decode(HistoryEntry.self) {
+                decoded.append(entry)
+            } else {
+                _ = try? container.decode(AnyElement.self)
+            }
+            // If neither decode moved the cursor, stop rather than spin on one element.
+            guard container.currentIndex > index else { break }
+        }
+        entries = decoded
+    }
+}
+
 @MainActor
 final class HistoryStore: ObservableObject {
     @Published private(set) var entries: [HistoryEntry]
@@ -109,8 +147,8 @@ final class HistoryStore: ObservableObject {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         if let data = try? Data(contentsOf: paths.historyFile),
-           let decoded = try? decoder.decode([HistoryEntry].self, from: data) {
-            entries = decoded
+           let decoded = try? decoder.decode(LenientHistory.self, from: data) {
+            entries = decoded.entries
         } else {
             entries = []
         }
