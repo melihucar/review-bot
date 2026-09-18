@@ -530,13 +530,34 @@ actor ReviewEngine {
                 commitSHA: metadata.headRefOid
             )
 
+            // Never post a review onto a commit it did not read. A review takes minutes, and a
+            // push can land meanwhile: an approval of the old commit may still count toward the
+            // new one's required approvals, so the re-read is the real protection — if the head
+            // moved, post nothing. The request stays open, the next poll discovers the new head
+            // under a fresh dedup key, and this failure count, keyed to the old head, never
+            // matters again. `commit_id` is the backstop for the second or so between the re-read
+            // and the post: GitHub attaches a review that names no commit (all `gh pr review` can
+            // send) to whatever the head is by then, while a pinned one lands on the commit it
+            // describes. GitHub clears the review request on any review, so a review that loses
+            // that race needs a re-request. A head that moves faster than a review completes is
+            // reviewed again each poll — accepted over posting a stale approval.
+            let current = try await pullRequestMetadata(number: pullRequest.number, repository: repository)
+            guard current.headRefOid == metadata.headRefOid else {
+                throw ReviewEngineError.reviewIncomplete(
+                    "Not posted — the head moved from \(metadata.headRefOid.prefix(8)) to "
+                        + "\(current.headRefOid.prefix(8)) while the review ran. The next poll "
+                        + "reviews the new head. Saved at \(reviewFile.path)"
+                )
+            }
+
             let post = try await runner.run(
                 "gh",
                 arguments: [
-                    "pr", "review", String(pullRequest.number),
-                    "--repo", repository.githubSlug,
-                    decision.ghArgument,
-                    "--body-file", reviewFile.path,
+                    "api", "--method", "POST",
+                    "repos/\(repository.githubSlug)/pulls/\(pullRequest.number)/reviews",
+                    "-f", "commit_id=\(metadata.headRefOid)",
+                    "-f", "event=\(decision.reviewEvent)",
+                    "-F", "body=@\(reviewFile.path)",
                 ],
                 timeout: 120
             )

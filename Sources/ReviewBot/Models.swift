@@ -428,11 +428,12 @@ enum ReviewDecision: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    var ghArgument: String {
+    /// The `event` the pull request reviews API expects for this decision.
+    var reviewEvent: String {
         switch self {
-        case .approve: "--approve"
-        case .requestChanges: "--request-changes"
-        case .comment: "--comment"
+        case .approve: "APPROVE"
+        case .requestChanges: "REQUEST_CHANGES"
+        case .comment: "COMMENT"
         }
     }
 

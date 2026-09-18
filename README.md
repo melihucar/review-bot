@@ -15,7 +15,7 @@ The app stores no GitHub or AI credentials. It uses each developer's existing au
 - Append a small developer-specific instruction prompt to every review.
 - Enforce repository-specific rules from `REVIEW.md`.
 - Run enabled reviewers independently in a read-only worktree.
-- Post the strictest reviewer decision through `gh pr review`.
+- Post the strictest reviewer decision through the GitHub CLI, pinned to the commit that was reviewed.
 - Keep activity history, detailed logs, and generated review Markdown locally.
 - Avoid duplicate reviews while allowing a new commit or a new review request at the same commit to trigger another review.
 - Optionally launch at login after the app is installed in `/Applications`.
@@ -122,8 +122,8 @@ Generated reviews clearly identify each reviewer and preserve their findings in 
 7. Run enabled reviewers with read-only tools and a 15-minute timeout.
 8. If any enabled reviewer fails or returns no parseable verdict, post nothing and leave the request unmarked so a later poll retries it.
 9. If the reviewers disagree across the gate, run one read-only reconciliation pass and use its adjudicated verdict.
-10. Otherwise aggregate the verdicts, save the Markdown, and submit the resulting decision through the authenticated GitHub CLI.
-11. Mark the request completed only after GitHub accepts it, then remove the worktree.
+10. Otherwise aggregate the verdicts and save the Markdown, then re-read the pull request's head; if it moved since discovery, post nothing so the next poll reviews the new commit instead.
+11. Submit the decision through GitHub's pull request reviews API (`gh api`), pinned to the reviewed commit. Mark the request completed only after GitHub accepts it, then remove the worktree.
 
 If submission fails, the request is not marked complete and will be retried during a later poll.
 
