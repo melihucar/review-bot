@@ -20,6 +20,38 @@ enum VerdictParser {
         return ReviewVerdict(rawValue: String(output[range]).uppercased())
     }
 
+    /// True when the review says, in its own words, that it could not actually assess the pull
+    /// request — the evidence was unreadable, missing, or never reached.
+    ///
+    /// A verdict line is cheap to emit and the contract demands one, so a reviewer that spent its
+    /// whole turn failing to open the diff still signs off with `VERDICT: NITS_ONLY` — "I found
+    /// no problems" being literally true of a review that looked at nothing. Taken at face value
+    /// that is an approval, which is the most damaging thing this tool can produce. It happened:
+    /// on a 181-file pull request whose diff exceeded the tool sandbox's file cap, the reviewer
+    /// reported plainly that it could not read the diff and approved in the same breath.
+    ///
+    /// So the *body* overrides the verdict line. Each phrase is one a model uses about its own
+    /// inability and is anchored to the review itself, so ordinary prose about the pull request
+    /// cannot trip it: "this pull request could not be reviewed" matches, while "this migration
+    /// could not be verified" — a legitimate finding — does not.
+    static func statesItCouldNotAssess(_ body: String) -> Bool {
+        let patterns = [
+            #"(?i)\b(?:this )?(?:pull request|PR|diff|change)\b[^.\n]{0,40}\bcould not be (?:reviewed|assessed|evaluated)\b"#,
+            #"(?i)\bI (?:can ?not|cannot|could not|am unable to|was unable to)\b[^.\n]{0,40}\b(?:review|assess|evaluate)\b"#,
+            #"(?i)\bno basis to (?:certify|assess|judge)\b"#,
+            #"(?i)\b(?:merge )?gate cannot be (?:meaningfully )?determined\b"#,
+            #"(?i)\bunable to assess\b"#,
+        ]
+        return patterns.contains { pattern in
+            guard let regex = try? NSRegularExpression(
+                pattern: pattern,
+                options: [.anchorsMatchLines]
+            ) else { return false }
+            let range = NSRange(body.startIndex..., in: body)
+            return regex.firstMatch(in: body, range: range) != nil
+        }
+    }
+
     static func bodyWithoutTrailer(_ output: String) -> String {
         output
             .split(separator: "\n", omittingEmptySubsequences: false)

@@ -466,7 +466,15 @@ actor ReviewEngine {
             // Nobody finishing is different in kind: there is no review to post, so leave the
             // request unmarked for the next poll.
             let unfinished = results.filter { $0.verdict == nil }
-            guard results.contains(where: { $0.verdict != nil }) else {
+            // A reviewer that *reported* it could not assess the pull request is a different
+            // thing from one that crashed. It ran, it looked, and it concluded the evidence was
+            // not there — an answer, and one the author needs, because the alternative is a pull
+            // request that silently never gets reviewed. So when nobody reached a verdict and at
+            // least one reviewer said why, post that as a neutral comment rather than staying
+            // quiet and retrying: retrying re-reads the same evidence, and silence means the
+            // author learns nothing until the failure budget gives up without a word.
+            let saidWhy = results.contains { $0.couldNotAssess }
+            guard results.contains(where: { $0.verdict != nil }) || saidWhy else {
                 let detail = results.isEmpty
                     ? "no reviewer produced a result"
                     : unfinished.map { result in
@@ -902,10 +910,21 @@ actor ReviewEngine {
                 arguments: ["pr", "diff", String(number), "--repo", repository.githubSlug],
                 timeout: 120
             )
-            guard diff.succeeded else {
-                throw ReviewEngineError.commandFailed("Could not download the PR diff: \(conciseError(diff))")
+            if diff.succeeded {
+                diffText = diff.stdout
+            } else if let local = await localDiffText(repository: repository, metadata: metadata) {
+                // GitHub's diff endpoint refuses anything over 20,000 lines with a 406, which is a
+                // property of the API rather than of the pull request: the commits are already in
+                // the clone, so the same three-dot diff computes locally with no ceiling. Falling
+                // back is strictly better than failing, and it is not a lesser answer — `git diff
+                // base...head` is exactly what `gh pr diff` asks the API to render.
+                diffText = local
+            } else {
+                throw ReviewEngineError.commandFailed(
+                    "Could not download the PR diff: \(conciseError(diff)); computing it from the "
+                        + "local clone did not work either."
+                )
             }
-            diffText = diff.stdout
         }
         try Data(diffText.utf8).write(
             to: worktree.appendingPathComponent(".review-bot-diff.patch"),
@@ -1142,6 +1161,43 @@ actor ReviewEngine {
         return diff.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : diff.stdout
     }
 
+    /// The pull request's three-dot diff computed from the clone instead of the API, or `nil` when
+    /// the base cannot be resolved locally.
+    ///
+    /// `review` has already fetched both sides — the PR head and
+    /// `refs/remotes/origin/<baseRefName>` — so this needs no network. `base...head` is git's own
+    /// spelling of "merge-base to head", which is the same diff `gh pr diff` renders, so a reviewer
+    /// cannot tell which route produced the patch it reads.
+    private func localDiffText(
+        repository: RepositoryConfiguration,
+        metadata: PullRequestMetadata
+    ) async -> String? {
+        func git(_ arguments: [String], timeout: Int = 120) async -> CommandResult? {
+            try? await runner.run("git", arguments: ["-C", repository.path] + arguments, timeout: timeout)
+        }
+
+        // Same rule as `mergePreview`: prefer the ref that was just fetched over `baseRefOid`,
+        // which is GitHub's snapshot of the base at the time it answered and may be stale.
+        let tracked = await git([
+            "rev-parse", "--verify", "--quiet",
+            "refs/remotes/origin/\(metadata.baseRefName)^{commit}",
+        ])
+        let base = tracked.flatMap { result -> String? in
+            guard result.succeeded else { return nil }
+            let oid = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            return oid.isEmpty ? nil : oid
+        } ?? metadata.baseRefOid
+
+        guard let diff = await git(["diff", "\(base)...\(metadata.headRefOid)"]), diff.succeeded
+        else { return nil }
+
+        // An empty patch is a real answer for a pull request that changes nothing, but it is also
+        // what a silently wrong revision range produces. Since this path only runs after the API
+        // already refused, treat empty as failure rather than sending reviewers an empty diff and
+        // letting them approve it.
+        return diff.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : diff.stdout
+    }
+
     private func runReviewers(
         configuration: ReviewBotConfiguration,
         worktree: URL,
@@ -1194,22 +1250,26 @@ actor ReviewEngine {
         prompt: String,
         worktree: URL
     ) async -> ReviewerResult {
-        var result = await runReviewerOnce(
-            name,
-            configuration: configuration,
-            prompt: prompt,
-            worktree: worktree
+        var result = withdrawnIfItCouldNotAssess(
+            await runReviewerOnce(
+                name,
+                configuration: configuration,
+                prompt: prompt,
+                worktree: worktree
+            )
         )
         var attempt = 1
         while attempt < Self.reviewerAttemptsPerReview, result.isWorthRetrying {
             await logger.append(
                 "\(name.rawValue) \(result.failure.map { "failed (\($0))" } ?? "returned no verdict"); running it again before giving up on this review."
             )
-            result = await runReviewerOnce(
-                name,
-                configuration: configuration,
-                prompt: prompt,
-                worktree: worktree
+            result = withdrawnIfItCouldNotAssess(
+                await runReviewerOnce(
+                    name,
+                    configuration: configuration,
+                    prompt: prompt,
+                    worktree: worktree
+                )
             )
             attempt += 1
         }
@@ -1219,6 +1279,31 @@ actor ReviewEngine {
             )
         }
         return result
+    }
+
+    /// Drops the verdict of a reviewer whose own review says it could not assess the pull
+    /// request, and records why in its place.
+    ///
+    /// The verdict line and the body are both the model's, and when they disagree the body is the
+    /// honest one: a reviewer that reports it never read the diff and then emits `NITS_ONLY` has
+    /// described its situation accurately and then answered a question it had no business
+    /// answering. Taking the verdict would turn "I could not look" into an approval.
+    ///
+    /// Classified terminal, so it is not run again inside this review: a reviewer that has
+    /// reasoned its way to "there is nothing here I can read" reaches the same conclusion the
+    /// second time.
+    private func withdrawnIfItCouldNotAssess(_ result: ReviewerResult) -> ReviewerResult {
+        guard result.verdict != nil,
+              VerdictParser.statesItCouldNotAssess(VerdictParser.bodyWithoutTrailer(result.output))
+        else { return result }
+
+        var withdrawn = result
+        withdrawn.verdict = nil
+        // The wording carries the classification: `failureClass` is derived from this message,
+        // and "could not assess this pull request" is a terminal marker.
+        withdrawn.failure = "reported that it could not assess this pull request, so its verdict "
+            + "was not counted"
+        return withdrawn
     }
 
     private func runReviewerOnce(
@@ -1366,7 +1451,7 @@ actor ReviewEngine {
                     "--output-format", "text",
                 ],
                 currentDirectory: worktree,
-                timeout: 900
+                timeout: configuration.timeoutSeconds
             )
             guard result.succeeded else {
                 return failedReviewer(.claude, configuration, message: conciseError(result))
@@ -1407,7 +1492,7 @@ actor ReviewEngine {
                     prompt,
                 ],
                 currentDirectory: worktree,
-                timeout: 900
+                timeout: configuration.timeoutSeconds
             )
             guard result.succeeded,
                   let output = try? String(contentsOf: outputFile, encoding: .utf8) else {
@@ -1455,7 +1540,7 @@ actor ReviewEngine {
                     prompt,
                 ],
                 currentDirectory: worktree,
-                timeout: 900,
+                timeout: configuration.timeoutSeconds,
                 environment: [
                     "OPENCODE_CONFIG_DIR": paths.opencodeConfigDirectory.path,
                     "OPENCODE_CONFIG_CONTENT": permissions,
@@ -1662,7 +1747,12 @@ actor ReviewEngine {
         // Only reviewers that produced a verdict get a details block; a failed one has no
         // review body to show, and an empty disclosure triangle reads as an empty review
         // rather than an absent one. The blockquote below names them instead.
-        let details = results.filter { $0.verdict != nil }.map { result in
+        // A details block needs something worth opening. A reviewer that produced a verdict has
+        // its review; a reviewer that reported it could not assess the pull request has its
+        // account of why, which is the entire value of the comment when nobody reached a verdict.
+        // A reviewer that crashed or timed out has neither, and an empty disclosure triangle
+        // reads as an empty review rather than an absent one — the blockquote names those.
+        let details = results.filter { $0.verdict != nil || $0.couldNotAssess }.map { result in
             """
             <details><summary><strong>\(result.reviewer.rawValue) — \(result.model)</strong></summary>
 
@@ -1678,6 +1768,15 @@ actor ReviewEngine {
         case .requestChanges:
             note = "At least one reviewer found an issue the current decision policy treats as blocking."
         case .comment:
+            if results.allSatisfy({ $0.verdict == nil }), guardReason == nil {
+                // Nobody assessed the pull request. Saying "this review is neutral" here would
+                // describe a judgement that was never made; what the author needs is that no
+                // review happened and why, so the reasons below are the whole message.
+                note = "**No reviewer was able to assess this pull request**, so this comment "
+                    + "reports why rather than offering a judgement. Nothing here should be read "
+                    + "as approval."
+                break
+            }
             if approvalWithheldForPartialPanel {
                 note = "The decision policy would approve this, but **a partial panel never approves**, so it posts as a neutral comment. Re-request the review once every enabled reviewer can run."
             } else {
@@ -1698,6 +1797,10 @@ actor ReviewEngine {
                 let reason: String
                 if result.timedOut {
                     reason = "timed out"
+                } else if result.couldNotAssess {
+                    // Its own words, not a failure summary: this reviewer worked and told us it
+                    // had nothing to go on, and the detail is what the author has to act on.
+                    reason = "could not assess the pull request"
                 } else if let failure = result.failure {
                     reason = "failed — \(inlineDetail(failure))"
                 } else {
@@ -1705,7 +1808,13 @@ actor ReviewEngine {
                 }
                 return "**\(result.reviewer.rawValue)** (\(reason))"
             }.joined(separator: ", ")
-            partialPanelDisclosure = """
+            partialPanelDisclosure = unfinished.count == results.count
+                ? """
+
+
+                > **No verdict was reached: \(missing).** This is not an approval and not a rejection — the pull request has not been reviewed. Each reviewer's own account of why is below; a new commit or a fresh review request starts over.
+                """
+                : """
 
 
             > **Partial panel: \(missing) did not contribute a verdict to the panel.** The findings below come only from the reviewers that finished, so they are a weaker signal than a full panel's — weigh them accordingly.
