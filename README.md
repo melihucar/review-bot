@@ -158,7 +158,7 @@ Use **History → Show data folder** to open this location.
 
 - Source code inspected by Claude, Codex, or opencode is handled according to the account and provider configuration of those CLIs.
 - Review Bot does not start a shell for repository values, PR titles, prompts, or paths; commands are passed as argument arrays.
-- Claude is restricted to read/search tools. Codex runs with its read-only sandbox. opencode runs under a read-only agent whose permissions deny everything except Read, Grep, and Glob; the pull request's own `opencode.json`/`.opencode` files cannot override that, and plugins are disabled.
+- Claude runs with only the `Read`, `Grep`, and `Glob` tools and cannot read outside the review worktree unless the developer's own user settings (or an organization's managed settings) explicitly allow it. It ignores the pull request's own Claude settings and MCP configuration, and runs no hooks or MCP servers from user, project, or local settings. Verified against Claude Code 2.1.212; a current `claude` CLI is required. Codex runs with its read-only sandbox. opencode runs under a read-only agent whose permissions deny everything except Read, Grep, and Glob; the pull request's own `opencode.json`/`.opencode` files cannot override that, and plugins are disabled.
 - Review work never modifies the developer's current branch or working tree.
 - No review is marked complete until GitHub accepts the submitted result.
 

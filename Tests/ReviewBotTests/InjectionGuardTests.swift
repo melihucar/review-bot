@@ -159,4 +159,115 @@ final class InjectionGuardTests: XCTestCase {
         )
         XCTAssertEqual(flag, .verdictContradictsOwnFindings)
     }
+
+    // MARK: - bodySaysUnmergeable negation
+
+    func testNegatedBlockerSentencesFromAReleaseReviewAllowApproval() {
+        let sentences = [
+            "I sampled the executable tooling, config, and Dockerfile closely; I found no merge-blocking defect, only two small tooling polish items below.",
+            "I sampled the promotion-time risks and read both new tools end-to-end; I found no merge-blocking or should-fix defect.",
+        ]
+        for sentence in sentences {
+            let body = """
+            ## Summary
+            \(sentence)
+
+            ## Findings
+            ### Blocking
+            None.
+            ### Should-fix
+            None.
+            ### Nit
+            - `tools/a.py:12` — polish.
+
+            ## Merge gate
+            Mergeable as-is.
+            """
+            let results = [result(verdict: .nitsOnly, body: body)]
+            let flag = InjectionGuard.flagIfApproveUnsafe(
+                thread: "clean",
+                diff: "",
+                results: results,
+                adjudication: nil
+            )
+            XCTAssertNil(flag, "false positive for: \(sentence)")
+        }
+    }
+
+    func testOtherNegatedPhrasingsAllowApproval() {
+        let bodies = [
+            "Nothing here needs to be fixed before merge.",
+            "None of these findings are merge-blocking.",
+            "It isn't merge-blocking.",
+            "Merge-blocking issues: none.",
+            "Merge-blocking: **None**",
+            "There are zero merge-blocking findings.",
+            "I would not hold the merge for this nit.",
+            "The change lands without any merge-blocking issues.",
+            "I found no should-fix or merge-blocking defect.",
+            "I can't find a merge-blocking issue.",
+            "There is not a single merge-blocking issue.",
+            "Nothing here is merge-blocking and nothing needs to be fixed.",
+            "I found no merge-blocking issues, but a few nits are listed below.",
+            "No remaining merge-blocking issues after the fix.",
+        ]
+        for body in bodies {
+            let results = [result(verdict: .clean, body: body)]
+            let flag = InjectionGuard.flagIfApproveUnsafe(
+                thread: "clean",
+                diff: "",
+                results: results,
+                adjudication: nil
+            )
+            XCTAssertNil(flag, "false positive for: \(body)")
+        }
+    }
+
+    func testBlockerStatementsNearNegationWordsStillFlagged() {
+        let bodies = [
+            "This cannot be merged.",
+            "Do not merge until the migration is fixed.",
+            "No, this cannot be merged.",
+            "I found no merge-blocking defect, but the migration must be fixed.",
+            "Not having a rollback plan is merge-blocking.",
+            "A rollback plan is required, without which this cannot be merged.",
+            "The endpoint has no auth check and must be fixed.",
+            "It returns nothing and must be fixed.",
+            "Merge-blocking findings: none have been fixed.",
+            "Merge-blocking issues: none are resolved.",
+            "Merge-blocking defects: none can be deferred.",
+            "Nothing validates the input; this must be fixed.",
+            "The no-op branch must be fixed.",
+            "It's not a cosmetic issue and must be fixed.",
+            "Without a fix this cannot be merged.",
+            "Not a nit — this must be fixed.",
+            "No tests cover a path that must be fixed.",
+            // A double negative argues for the blocker.
+            "I see no reason not to hold the merge until the migration stops corrupting existing rows.",
+            // A comparative or an exception names the blocker it seems to deny.
+            "Nothing is more merge-blocking than silently corrupting existing rows.",
+            "I found no merge-blocking defect other than the unguarded migration.",
+            "Nothing needs to be fixed more urgently than the migration.",
+            "There is nothing merge-blocking except the migration.",
+            "No merge-blocking issue apart from the data loss in the migration.",
+            "Nothing merge-blocking but the migration.",
+            "There is no merge-blocking defect besides the migration.",
+            "I found no merge-blocking defects, except the migration still deletes existing rows.",
+            "No merge-blocking defects (except the data-loss migration).",
+            // "other", "else" and "further" imply a blocker exists; "this" can mean "so".
+            "The migration deletes existing rows. No other issue is this merge-blocking.",
+            "The migration deletes existing rows. Nothing else is merge-blocking.",
+            "I found no further merge-blocking issues.",
+        ]
+        for body in bodies {
+            let results = [result(verdict: .clean, body: body)]
+            let flag = InjectionGuard.flagIfApproveUnsafe(
+                thread: "clean",
+                diff: "",
+                results: results,
+                adjudication: nil
+            )
+            XCTAssertEqual(flag, .verdictContradictsOwnFindings, "missed gating phrase: \(body)")
+        }
+    }
 }
