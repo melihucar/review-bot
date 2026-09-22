@@ -19,6 +19,9 @@ final class AppModel: ObservableObject {
     /// it was still running.
     @Published private(set) var runningReviews: [ReviewQueueItem] = []
     @Published var errorMessage: String?
+    /// Refreshed from the history after every event that ends a review, so the figures in
+    /// the menu bar and the Statistics tab move the moment a review posts.
+    @Published private(set) var statistics: ReviewStatistics = .empty
 
     let settings: SettingsStore
     let history: HistoryStore
@@ -42,6 +45,7 @@ final class AppModel: ObservableObject {
         history = HistoryStore(paths: paths)
         engine = ReviewEngine(paths: paths, runner: runner, credentials: credentials)
         launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+        statistics = ReviewStatistics.compute(from: history.entries)
     }
 
     func start() {
@@ -60,6 +64,11 @@ final class AppModel: ObservableObject {
         Task { [weak self] in
             await self?.performPoll(manual: true)
         }
+    }
+
+    func clearHistory() {
+        history.clear()
+        statistics = ReviewStatistics.compute(from: history.entries)
     }
 
     func togglePaused() {
@@ -307,8 +316,12 @@ final class AppModel: ObservableObject {
             manual: manual,
             onEvent: { [weak self] entry in
                 await MainActor.run {
-                    self?.history.append(entry)
-                    self?.updateQueue(for: entry)
+                    guard let self else { return }
+                    self.history.append(entry)
+                    self.updateQueue(for: entry)
+                    if entry.kind.endsAReview || entry.kind == .merged {
+                        self.statistics = ReviewStatistics.compute(from: self.history.entries)
+                    }
                 }
             },
             onStatus: { [weak self] value in
@@ -333,6 +346,8 @@ final class AppModel: ObservableObject {
         case .approved, .changesRequested, .commented, .failed:
             pendingReviews.removeAll(where: { $0.id == item.id })
             runningReviews.removeAll(where: { $0.id == item.id })
+        case .merged:
+            break
         }
     }
 }

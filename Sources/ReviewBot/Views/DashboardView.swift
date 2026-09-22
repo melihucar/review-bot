@@ -18,6 +18,9 @@ struct DashboardView: View {
             PromptSettingsView(settings: model.settings)
                 .tabItem { Label("Prompt", systemImage: "text.quote") }
 
+            StatisticsView(model: model)
+                .tabItem { Label("Statistics", systemImage: "chart.bar.xaxis") }
+
             HistoryView(model: model, history: model.history)
                 .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
         }
@@ -762,6 +765,143 @@ private struct PromptSettingsView: View {
     }
 }
 
+private struct StatisticsView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        let stats = model.statistics
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Review statistics")
+                        .font(.title2.weight(.semibold))
+                    Text("What Review Bot posted in the last \(stats.windowDays) days, how fast, and whether its change requests were acted on. Computed from the activity history on this Mac.")
+                        .foregroundStyle(.secondary)
+                }
+
+                StatisticsGroup(title: "Decisions posted") {
+                    StatisticTile(title: "Reviews", value: "\(stats.reviewsPosted)", detail: "\(stats.failed) failed")
+                    StatisticTile(title: "Approved", value: "\(stats.approved)", tint: .green)
+                    StatisticTile(title: "Changes requested", value: "\(stats.changesRequested)", tint: .orange)
+                    StatisticTile(title: "Comments", value: "\(stats.commented)", tint: .purple)
+                }
+
+                StatisticsGroup(title: "Speed") {
+                    StatisticTile(
+                        title: "Review duration",
+                        value: ReviewStatistics.describe(seconds: stats.averageDurationSeconds),
+                        detail: "median \(ReviewStatistics.describe(seconds: stats.medianDurationSeconds)) · last \(ReviewStatistics.describe(seconds: stats.lastDurationSeconds))",
+                        help: "From checkout to the posted decision, averaged over the window. Refreshed after every review."
+                    )
+                    StatisticTile(
+                        title: "Response time",
+                        value: ReviewStatistics.describe(seconds: stats.averageResponseSeconds),
+                        detail: "median \(ReviewStatistics.describe(seconds: stats.medianResponseSeconds))",
+                        help: "From the review request on GitHub to the posted decision — includes time spent waiting for a poll and in the queue."
+                    )
+                }
+
+                StatisticsGroup(title: "Follow-through") {
+                    StatisticTile(
+                        title: "Change requests acted on",
+                        value: ReviewStatistics.describe(rate: stats.changesRequestedThenApprovedRate),
+                        detail: "\(stats.changesRequestedThenApproved) of \(stats.pullRequestsWithChangesRequested) pull requests later approved",
+                        tint: .orange,
+                        help: "A change request counts as acted on when Review Bot later approved the same pull request at a different commit."
+                    )
+                    StatisticTile(
+                        title: "…and merged",
+                        value: ReviewStatistics.describe(rate: stats.changesRequestedThenMergedRate),
+                        detail: "\(stats.changesRequestedThenMerged) of \(stats.pullRequestsWithChangesRequested) merged after the request",
+                        tint: .orange
+                    )
+                    StatisticTile(
+                        title: "Rounds to approval",
+                        value: stats.averageRoundsToApproval.map { String(format: "%.2f", $0) } ?? "—",
+                        detail: "change requests before an approval followed",
+                        help: "1.00 means every change request was resolved in one round."
+                    )
+                    StatisticTile(
+                        title: "Approvals merged",
+                        value: ReviewStatistics.describe(rate: stats.approvedThenMergedRate),
+                        detail: "\(stats.approvedThenMerged) of \(stats.pullRequestsApproved) approved pull requests",
+                        tint: .green
+                    )
+                }
+
+                StatisticsGroup(title: "Tokens and spend") {
+                    StatisticTile(
+                        title: "Tokens",
+                        value: TokenUsage.abbreviated(stats.totalTokens),
+                        detail: "\(TokenUsage.abbreviated(stats.meteredTokens)) on API keys · \(TokenUsage.abbreviated(stats.sessionTokens)) on subscriptions",
+                        help: "Everything the reviewers reported. Claude reports its tokens in either sign-in mode; Codex and opencode report none."
+                    )
+                    StatisticTile(
+                        title: "Cost",
+                        value: stats.totalCostUSD.map { String(format: "$%.2f", $0) } ?? (stats.meteredTokens > 0 ? "unknown" : "—"),
+                        detail: stats.totalCostUSD == nil && stats.meteredTokens > 0
+                            ? "a metered review's cost could not be priced"
+                            : "reviewers billed per token only — a subscription is never priced",
+                        help: "Only reviewers set to API-key auth are billed per review; a signed-in CLI's cost is its subscription."
+                    )
+                }
+
+                if stats.reviewsPosted == 0 {
+                    Text("No reviews were posted in this window yet. Figures fill in as Review Bot reviews pull requests.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.top, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct StatisticsGroup<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.headline)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 10)], alignment: .leading, spacing: 10) {
+                content
+            }
+        }
+    }
+}
+
+private struct StatisticTile: View {
+    let title: String
+    let value: String
+    var detail: String = ""
+    var tint: Color = .primary
+    var help: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title2.weight(.semibold).monospacedDigit())
+                .foregroundStyle(tint)
+            if !detail.isEmpty {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 64, alignment: .topLeading)
+        .padding(10)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+        .help(help)
+    }
+}
+
 private struct HistoryView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var history: HistoryStore
@@ -803,7 +943,7 @@ private struct HistoryView: View {
             isPresented: $confirmClear,
             titleVisibility: .visible
         ) {
-            Button("Clear history", role: .destructive) { history.clear() }
+            Button("Clear history", role: .destructive) { model.clearHistory() }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Generated review files and detailed logs will remain on disk.")
@@ -856,6 +996,12 @@ private struct HistoryRow: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .help("\(usage.tokenSummary) — metered reviewers only")
+                }
+                if let session = entry.sessionUsage {
+                    Text("\(TokenUsage.abbreviated(session.totalTokens)) tok · subscription")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .help("\(session.tokenSummary) — consumed on a signed-in CLI, covered by its subscription")
                 }
                 if let value = entry.pullRequestURL, let url = URL(string: value) {
                     Link("Open PR", destination: url)

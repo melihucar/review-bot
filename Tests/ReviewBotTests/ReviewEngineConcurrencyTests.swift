@@ -240,6 +240,9 @@ private actor MultiPullRequestMock: CommandRunning {
         if arguments.starts(with: ["api", "user"]) {
             return result(stdout: "reviewer\n")
         }
+        if arguments.starts(with: ["search", "prs"]), arguments.contains("--merged") {
+            return result(stdout: "[]")
+        }
         if arguments.starts(with: ["search", "prs"]) {
             let entries = pullRequests.map {
                 #"{"number":\#($0),"title":"PR \#($0)","url":"https://github.com/acme/widget/pull/\#($0)"}"#

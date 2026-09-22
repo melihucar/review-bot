@@ -39,6 +39,9 @@ actor ReviewEngine {
         let repository: RepositoryConfiguration
         let requestMarker: String
         let reviewKey: String
+        /// When GitHub recorded the request, when the marker is a timestamp rather than
+        /// the head-commit fallback. Stamped on the history so response time can be measured.
+        let requestedAt: Date?
     }
 
     /// Every seam has a production default, so the app constructs the engine with `paths` alone
@@ -112,6 +115,7 @@ actor ReviewEngine {
                 )
                 pendingReviews.append(contentsOf: discovered.pending)
                 deferredRequests += discovered.deferred
+                await recordMergedPullRequests(repository: repository, onEvent: onEvent)
             }
 
             await runPendingReviews(
@@ -255,11 +259,14 @@ actor ReviewEngine {
                         }
                     }
 
+                    let requestedAt = Self.requestDate(from: requestMarker)
                     await emit(
                         kind: .requestDetected,
                         repository: repository,
                         pullRequest: pullRequest,
                         message: "Review requested at \(shortMarker(requestMarker)).",
+                        requestedAt: requestedAt,
+                        headCommit: metadata.headRefOid,
                         onEvent: onEvent
                     )
                     pending.append(
@@ -268,7 +275,8 @@ actor ReviewEngine {
                             metadata: metadata,
                             repository: repository,
                             requestMarker: requestMarker,
-                            reviewKey: reviewKey
+                            reviewKey: reviewKey,
+                            requestedAt: requestedAt
                         )
                     )
                 } catch {
@@ -389,6 +397,51 @@ actor ReviewEngine {
         }
     }
 
+    /// Records, once, each pull request Review Bot reviewed that has since been merged, so
+    /// the statistics can say whether a change request was followed through.
+    ///
+    /// One `gh search` per repository per poll. A failure here is logged and ignored: a
+    /// merged marker is bookkeeping, and it must never stop a poll from reviewing.
+    private func recordMergedPullRequests(
+        repository: RepositoryConfiguration,
+        onEvent: @escaping EventSink
+    ) async {
+        guard let result = try? await runner.run(
+            "gh",
+            arguments: [
+                "search", "prs",
+                "--repo", repository.githubSlug,
+                "--reviewed-by=@me",
+                "--merged",
+                "--sort", "updated",
+                "--limit", "100",
+                "--json", "number,title,url",
+            ],
+            timeout: 60
+        ), result.succeeded,
+        let merged = try? JSONDecoder().decode([PullRequestSummary].self, from: Data(result.stdout.utf8))
+        else {
+            await logger.append("Could not list merged pull requests for \(repository.githubSlug); merge tracking skipped this poll.")
+            return
+        }
+        for pullRequest in merged {
+            let key = "\(repository.githubSlug)#\(pullRequest.number)"
+            // Only pull requests this Review Bot posted a review on, and each only once.
+            // The prefix keeps the marker clear of the `slug#number@…` keys the round cap
+            // counts.
+            let marker = "merged:\(key)"
+            guard lastReviewed.head(for: key) != nil, !reviewedState.contains(marker) else { continue }
+            reviewedState.insert(marker)
+            await emit(
+                kind: .merged,
+                repository: repository,
+                pullRequest: pullRequest,
+                message: "Merged after Review Bot's review.",
+                onEvent: onEvent
+            )
+        }
+    }
+
     private static func queueStatus(completed: Int, total: Int) -> String {
         completed == 0
             ? "Reviewing \(total) pull requests…"
@@ -408,9 +461,13 @@ actor ReviewEngine {
         let pullRequest = pendingReview.summary
         let metadata = pendingReview.metadata
         let repository = pendingReview.repository
+        let startedAt = now()
         var worktreeURL: URL?
         var worktreeAdded = false
         var spent: TokenUsage?
+        /// What the session reviewers consumed — counted, never priced. Tracked beside `spent`
+        /// on the same two assignments, so a failure records it too.
+        var sessionSpent: TokenUsage?
 
         do {
             await announce("Preparing \(repository.name) #\(pullRequest.number)…")
@@ -454,6 +511,9 @@ actor ReviewEngine {
                 repository: repository,
                 pullRequest: pullRequest,
                 message: reviewerDescription(configuration),
+                requestedAt: pendingReview.requestedAt,
+                startedAt: startedAt,
+                headCommit: metadata.headRefOid,
                 onEvent: onEvent
             )
             await announce("Reviewing \(repository.name) #\(pullRequest.number)…")
@@ -486,6 +546,7 @@ actor ReviewEngine {
             // history entry is the only place that spend can ever be recorded. Re-computed once
             // the adjudicator has run, since reconciliation is a metered call of its own.
             spent = usageTotal(results: results, adjudication: nil, configuration: configuration)
+            sessionSpent = sessionUsageTotal(results: results, adjudication: nil, configuration: configuration)
 
             // Post as long as *someone* finished. A reviewer that failed is named in the posted
             // body rather than suppressing the review: holding the whole panel hostage to one CLI
@@ -546,6 +607,11 @@ actor ReviewEngine {
                     )
                 }
                 spent = usageTotal(
+                    results: results,
+                    adjudication: adjudicationSpend,
+                    configuration: configuration
+                )
+                sessionSpent = sessionUsageTotal(
                     results: results,
                     adjudication: adjudicationSpend,
                     configuration: configuration
@@ -650,12 +716,19 @@ actor ReviewEngine {
                     + (usage.costSummary.map { ", \($0)" } ?? "")
                     + "."
             } ?? ""
+            let sessionNote = sessionSpent.map {
+                " \(TokenUsage.abbreviated($0.totalTokens)) tokens on a subscription."
+            } ?? ""
             await emit(
                 kind: decision.historyKind,
                 repository: repository,
                 pullRequest: pullRequest,
-                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(withheldNote)\(usageNote)",
+                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(withheldNote)\(usageNote)\(sessionNote)",
                 usage: total,
+                sessionUsage: sessionSpent,
+                requestedAt: pendingReview.requestedAt,
+                startedAt: startedAt,
+                headCommit: metadata.headRefOid,
                 onEvent: onEvent
             )
         } catch {
@@ -681,7 +754,11 @@ actor ReviewEngine {
                     pullRequestTitle: pullRequest.title,
                     pullRequestURL: pullRequest.url,
                     message: message,
-                    usage: spent
+                    usage: spent,
+                    sessionUsage: sessionSpent,
+                    requestedAt: pendingReview.requestedAt,
+                    startedAt: startedAt,
+                    headCommit: metadata.headRefOid
                 )
             )
         }
@@ -893,6 +970,16 @@ actor ReviewEngine {
         } catch {
             throw ReviewEngineError.invalidResponse("Could not decode PR #\(number) metadata.")
         }
+    }
+
+    /// The request marker as a date, when it is the timeline's `created_at` rather than
+    /// the head-commit fallback.
+    static func requestDate(from marker: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        if let date = formatter.date(from: marker) { return date }
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: marker)
     }
 
     private func latestReviewRequestMarker(
@@ -1960,6 +2047,30 @@ actor ReviewEngine {
         }
     }
 
+    /// What the reviewers on a signed-in CLI consumed, for the panel's token figures. The
+    /// complement of `meteredUsage`: every reported usage `meteredUsage` leaves out, summed,
+    /// with the cost dropped — Claude's envelope carries a dollar figure in session mode too,
+    /// but that is the subscription's arithmetic, not a bill, and showing it would contradict
+    /// the rule that session reviewers are never priced.
+    private func sessionUsageTotal(
+        results: [ReviewerResult],
+        adjudication: ReviewerResult?,
+        configuration: ReviewBotConfiguration
+    ) -> TokenUsage? {
+        let entries = results + (adjudication.map { [$0] } ?? [])
+        let session = entries.compactMap { result -> TokenUsage? in
+            guard configuration.settings(for: result.reviewer).authMode != .apiKey,
+                  let usage = result.usage else {
+                return nil
+            }
+            return usage
+        }
+        guard !session.isEmpty else { return nil }
+        var total = session.reduce(TokenUsage(), +)
+        total.costUSD = nil
+        return total
+    }
+
     private func usageTotal(
         results: [ReviewerResult],
         adjudication: ReviewerResult?,
@@ -2154,6 +2265,10 @@ actor ReviewEngine {
         pullRequest: PullRequestSummary,
         message: String,
         usage: TokenUsage? = nil,
+        sessionUsage: TokenUsage? = nil,
+        requestedAt: Date? = nil,
+        startedAt: Date? = nil,
+        headCommit: String? = nil,
         onEvent: @escaping EventSink
     ) async {
         let entry = HistoryEntry(
@@ -2164,7 +2279,11 @@ actor ReviewEngine {
             pullRequestTitle: pullRequest.title,
             pullRequestURL: pullRequest.url,
             message: message,
-            usage: usage
+            usage: usage,
+            sessionUsage: sessionUsage,
+            requestedAt: requestedAt,
+            startedAt: startedAt,
+            headCommit: headCommit
         )
         await logger.append(
             "\(kind.label): \(repository.githubSlug)#\(pullRequest.number) — \(message)"

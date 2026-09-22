@@ -20,6 +20,87 @@ private func withoutPromptModelAndEffort(_ arguments: [String]) -> [String] {
 }
 
 final class ReviewEngineFeatureTests: XCTestCase {
+    func testAPostedDecisionRecordsWhenItWasRequestedStartedAndAtWhichCommit() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let started = try XCTUnwrap(events.first { $0.kind == .reviewStarted })
+        let approved = try XCTUnwrap(events.first { $0.kind == .approved })
+        // The timeline's `review_requested` timestamp, so the panel can say how long the
+        // author waited; the head commit, so a later approval at another commit reads as
+        // the change request having been acted on.
+        XCTAssertEqual(approved.requestedAt, ReviewEngine.requestDate(from: "2026-07-15T10:00:00Z"))
+        XCTAssertEqual(approved.headCommit, "1234567890abcdef")
+        XCTAssertEqual(approved.startedAt, started.startedAt)
+        let duration = try XCTUnwrap(approved.reviewDuration)
+        XCTAssertGreaterThanOrEqual(duration, 0)
+        XCTAssertLessThan(duration, 60, "a mocked review takes moments, not minutes")
+        XCTAssertNotNil(approved.responseTime)
+        XCTAssertNil(events.first { $0.kind == .requestDetected }?.reviewDuration, "only the entries that end a review have a duration")
+    }
+
+    func testAMergedPullRequestReviewBotReviewedIsRecordedOnce() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        await runner.markMerged([42, 99])
+        for _ in 0..<2 {
+            await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        }
+
+        let events = await recorder.snapshot()
+        let merged = events.filter { $0.kind == .merged }
+        // Once for #42, which Review Bot reviewed — never for #99, which it did not, and not
+        // again on the poll after.
+        XCTAssertEqual(merged.map(\.pullRequestNumber), [42])
+        XCTAssertEqual(merged.first?.message, "Merged after Review Bot's review.")
+        let postCount = await runner.postCount()
+        XCTAssertEqual(postCount, 1, "a merge marker must not re-open the review")
+    }
+
+    /// Claude reports its tokens in either sign-in mode. In session mode they are not a bill —
+    /// the subscription covers them — so they are recorded beside the metered usage, never in
+    /// it, never priced, and never posted in the usage table.
+    func testSessionModeTokensAreCountedButNeverPricedOrPosted() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeEmitsJSONEnvelope: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .session
+        configuration.includeUsageInReview = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let decision = try XCTUnwrap(events.last)
+        XCTAssertNil(decision.usage, "nothing was billed to a key")
+        let session = try XCTUnwrap(decision.sessionUsage)
+        XCTAssertEqual(session.inputTokens, 1_500)
+        XCTAssertEqual(session.cachedInputTokens, 5_000)
+        XCTAssertEqual(session.outputTokens, 200)
+        XCTAssertNil(session.costUSD, "the envelope's dollar figure is the subscription's arithmetic, not a bill")
+        XCTAssertTrue(decision.message.contains("tokens on a subscription"), decision.message)
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertFalse(postedBody.contains("Token usage and cost"), "the posted table is for metered reviewers only")
+    }
+
     func testCleanReviewRunsInWorktreeUsesRepositoryRulesAndPostsApproval() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock()
@@ -2480,6 +2561,9 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var claudeArgumentLists: [[String]] = []
     private var codexRuns = 0
     private var opencodeRuns = 0
+    /// What the merged-pull-request search answers, settable mid-test so a poll can "see"
+    /// a pull request merge after an earlier poll reviewed it.
+    private var mergedPullRequests: [Int] = []
     private var geminiRuns = 0
     private var geminiArgs: [String] = []
     /// The worktree's `.gemini/settings.json` and `.env` as they stood the moment `gemini`
@@ -2744,6 +2828,12 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "gh", arguments.starts(with: ["api", "user"]) {
             return result(stdout: "reviewer\n")
+        }
+        if executable == "gh", arguments.starts(with: ["search", "prs"]), arguments.contains("--merged") {
+            let entries = mergedPullRequests.map {
+                #"{"number":\#($0),"title":"Improve widgets","url":"https://github.com/acme/widget/pull/\#($0)"}"#
+            }
+            return result(stdout: "[\(entries.joined(separator: ","))]")
         }
         if executable == "gh", arguments.starts(with: ["search", "prs"]) {
             return result(stdout: #"[{"number":42,"title":"Improve widgets","url":"https://github.com/acme/widget/pull/42"}]"#)
@@ -3078,6 +3168,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func claudeInvocations() -> [[String]] { claudeArgumentLists }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
+    func markMerged(_ numbers: [Int]) { mergedPullRequests = numbers }
     func geminiCount() -> Int { geminiRuns }
     func geminiInvocation() -> [String] { geminiArgs }
     func geminiWorkspaceSettingsAtInvocation() -> String? { geminiWorkspaceSettings }

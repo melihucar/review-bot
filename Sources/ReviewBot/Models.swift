@@ -418,6 +418,10 @@ enum HistoryEventKind: String, Codable {
     case changesRequested
     case commented
     case failed
+    /// A pull request Review Bot had reviewed was merged. Recorded once per pull request,
+    /// from the poll that first sees it merged, so the statistics can say whether a
+    /// change request was followed through rather than only re-reviewed.
+    case merged
 
     var label: String {
         switch self {
@@ -427,6 +431,7 @@ enum HistoryEventKind: String, Codable {
         case .changesRequested: "Changes requested"
         case .commented: "Comment posted"
         case .failed: "Failed"
+        case .merged: "Merged"
         }
     }
 
@@ -438,6 +443,23 @@ enum HistoryEventKind: String, Codable {
         case .changesRequested: "exclamationmark.octagon.fill"
         case .commented: "text.bubble.fill"
         case .failed: "xmark.circle.fill"
+        case .merged: "arrow.triangle.merge"
+        }
+    }
+
+    /// The kinds that end a review: a posted decision or a failure.
+    var endsAReview: Bool {
+        switch self {
+        case .approved, .changesRequested, .commented, .failed: true
+        case .requestDetected, .reviewStarted, .merged: false
+        }
+    }
+
+    /// The kinds that mean a review was posted to GitHub.
+    var isPostedDecision: Bool {
+        switch self {
+        case .approved, .changesRequested, .commented: true
+        case .requestDetected, .reviewStarted, .failed, .merged: false
         }
     }
 }
@@ -455,6 +477,39 @@ struct HistoryEntry: Codable, Equatable, Identifiable {
     /// Combined usage for the review this entry describes, so spend can be totalled from
     /// `history.json` later. Absent on entries written before usage was tracked.
     var usage: TokenUsage?
+    /// Tokens consumed by the reviewers on a signed-in CLI — Claude reports them in its JSON
+    /// envelope whatever the sign-in mode. Kept apart from `usage`, which is what was *billed*
+    /// to a key: these are covered by a subscription, so they are counted but never priced,
+    /// and `costUSD` is always `nil` here. Absent when no session reviewer reported any.
+    var sessionUsage: TokenUsage?
+    /// When GitHub recorded the review request this review answers — the timestamp of the
+    /// `review_requested` event, when the timeline had one. `date - requestedAt` is how long
+    /// the author waited for Review Bot. Absent on entries written before it was tracked and
+    /// on requests whose marker fell back to the head commit.
+    var requestedAt: Date?
+    /// When the review of this pull request began — set on the entries that end a review, so
+    /// `date - startedAt` is how long the review took from checkout to the posted decision.
+    var startedAt: Date?
+    /// The head commit the review looked at, so a later approval at a *different* commit
+    /// can be told from a re-review of the same one.
+    var headCommit: String?
+
+    /// How long the review took, for the entries that end one.
+    var reviewDuration: TimeInterval? {
+        guard kind.endsAReview, let startedAt else { return nil }
+        return max(0, date.timeIntervalSince(startedAt))
+    }
+
+    /// How long the author waited between requesting the review and the posted decision.
+    var responseTime: TimeInterval? {
+        guard kind.isPostedDecision, let requestedAt else { return nil }
+        return max(0, date.timeIntervalSince(requestedAt))
+    }
+
+    /// `slug#number`, the key the statistics group a pull request's entries by.
+    var pullRequestKey: String? {
+        pullRequestNumber.map { "\(repositorySlug)#\($0)" }
+    }
 }
 
 struct ReviewQueueItem: Equatable, Identifiable {
@@ -463,6 +518,9 @@ struct ReviewQueueItem: Equatable, Identifiable {
     let pullRequestNumber: Int
     let pullRequestTitle: String
     let pullRequestURL: String?
+    /// When the review began, for a running item, so the queue can show how long it has been
+    /// at it. `nil` for a request that is still waiting.
+    let startedAt: Date?
 
     var id: String { "\(repositorySlug)#\(pullRequestNumber)" }
 
@@ -476,6 +534,7 @@ struct ReviewQueueItem: Equatable, Identifiable {
         pullRequestNumber = number
         pullRequestTitle = title
         pullRequestURL = entry.pullRequestURL
+        startedAt = entry.kind == .reviewStarted ? (entry.startedAt ?? entry.date) : nil
     }
 }
 

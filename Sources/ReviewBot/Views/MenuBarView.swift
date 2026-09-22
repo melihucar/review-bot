@@ -19,6 +19,7 @@ struct MenuBarView: View {
             queueSection
             Divider()
             configRow
+            statisticsRow
             activitySection
             Divider()
             footer
@@ -131,6 +132,25 @@ struct MenuBarView: View {
             Label("Every \(intervalLabel)", systemImage: "timer")
             Spacer()
             Label("\(enabledRepositoryCount) enabled", systemImage: "shippingbox")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    /// The figures that matter at a glance; the Statistics tab has the rest.
+    private var statisticsRow: some View {
+        let stats = model.statistics
+        return HStack(spacing: 8) {
+            Label(
+                "Avg review \(ReviewStatistics.describe(seconds: stats.averageDurationSeconds))",
+                systemImage: "stopwatch"
+            )
+            .help("Checkout to posted decision, averaged over the last \(stats.windowDays) days; refreshed after every review. Last: \(ReviewStatistics.describe(seconds: stats.lastDurationSeconds)).")
+            Spacer()
+            Label("\(stats.approved)", systemImage: "checkmark.circle")
+                .help("Approved in the last \(stats.windowDays) days")
+            Label("\(stats.changesRequested)", systemImage: "exclamationmark.octagon")
+                .help("Changes requested in the last \(stats.windowDays) days — \(ReviewStatistics.describe(rate: stats.changesRequestedThenApprovedRate)) later approved")
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -281,9 +301,17 @@ private struct QueueRow: View {
                     .lineLimit(1)
             }
             Spacer()
-            Text(state)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(color)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(state)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(color)
+                if let startedAt = item.startedAt {
+                    // Counts up on its own — how long this review has been at it.
+                    Text(startedAt, style: .timer)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .padding(7)
         .background(color.opacity(0.08))
@@ -299,6 +327,7 @@ extension HistoryEventKind {
         case .changesRequested: .orange
         case .commented: .purple
         case .failed: .red
+        case .merged: .green
         }
     }
 }
