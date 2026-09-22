@@ -39,6 +39,47 @@ actor ReviewEngine {
         let repository: RepositoryConfiguration
         let requestMarker: String
         let reviewKey: String
+        /// The configuration the request was discovered under. A queued request is
+        /// reviewed with it even if a later poll ran with a changed one, so a review never
+        /// switches panels halfway through the queue.
+        let configuration: ReviewBotConfiguration
+    }
+
+    // MARK: - The review queue
+    //
+    // Discovery and reviewing used to be one call: a poll listed the requests and then
+    // reviewed every one of them before returning, and the shell would not poll again until
+    // it had. A review is minutes of CLI time, so a request that arrived one minute into a
+    // long queue waited for the whole queue *and* the next poll interval before Review Bot
+    // even noticed it. Now a poll only discovers and enqueues; the reviews are run by
+    // workers that outlive the poll, and the next poll can enqueue behind them.
+
+    /// Requests waiting for a worker, in discovery order.
+    private var queue: [PendingPullRequest] = []
+    /// The review keys queued or in flight, so a poll that sees the same request again
+    /// while it is still being handled neither re-announces nor double-queues it.
+    private var queuedKeys: Set<String> = []
+    /// Workers currently running, each reviewing one request at a time.
+    private var workers = 0
+    /// Progress of the current batch — everything queued since the last time the queue
+    /// went idle — for the status line.
+    private var batchTotal = 0
+    private var batchCompleted = 0
+    /// The status to show once the queue drains, left by the most recent poll.
+    private var idleStatus: String?
+    private var idleWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// True when nothing is queued or being reviewed.
+    func isIdle() -> Bool {
+        workers == 0 && queue.isEmpty
+    }
+
+    /// Suspends until the queue has drained. Returns at once when it already has.
+    func waitUntilIdle() async {
+        guard !isIdle() else { return }
+        await withCheckedContinuation { continuation in
+            idleWaiters.append(continuation)
+        }
     }
 
     /// Every seam has a production default, so the app constructs the engine with `paths` alone
@@ -62,13 +103,23 @@ actor ReviewEngine {
         try? paths.prepare()
     }
 
-    /// - Parameter manual: a poll the user asked for ("Run now"). It ignores the
-    ///   retry backoff and the failure budget, so fixing whatever broke the
-    ///   reviewers — a missing CLI, a bad model name, expired auth — and clicking
-    ///   Run now resumes abandoned requests without editing stored state.
+    /// Discovers review requests, queues the new ones and makes sure workers are
+    /// reviewing them.
+    ///
+    /// - Parameters:
+    ///   - manual: a poll the user asked for ("Run now"). It ignores the
+    ///     retry backoff and the failure budget, so fixing whatever broke the
+    ///     reviewers — a missing CLI, a bad model name, expired auth — and clicking
+    ///     Run now resumes abandoned requests without editing stored state.
+    ///   - awaitCompletion: whether to return only once the queue has drained. The default
+    ///     is what a test wants — everything the poll found has been reviewed and posted
+    ///     when the call returns. The app passes `false`: its poll returns as soon as
+    ///     discovery is done, and it polls again on the interval while the workers keep
+    ///     reviewing, which is what lets a request that arrives mid-queue join it.
     func poll(
         configuration: ReviewBotConfiguration,
         manual: Bool = false,
+        awaitCompletion: Bool = true,
         onEvent: @escaping EventSink,
         onStatus: @escaping StatusSink
     ) async {
@@ -99,7 +150,6 @@ actor ReviewEngine {
             }
             let githubUser = userResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            var pendingReviews: [PendingPullRequest] = []
             var deferredRequests = 0
             for repository in repositories {
                 let discovered = await discoverPendingReviews(
@@ -110,23 +160,29 @@ actor ReviewEngine {
                     onEvent: onEvent,
                     onStatus: onStatus
                 )
-                pendingReviews.append(contentsOf: discovered.pending)
+                enqueue(discovered.pending)
                 deferredRequests += discovered.deferred
             }
 
-            await runPendingReviews(
-                pendingReviews,
-                configuration: configuration,
+            let watching = watchingStatus(
+                repositoryCount: repositories.count,
+                deferredRequests: deferredRequests
+            )
+            startWorkers(
+                limit: configuration.maxConcurrentReviews,
                 onEvent: onEvent,
                 onStatus: onStatus
             )
-
-            await onStatus(
-                watchingStatus(
-                    repositoryCount: repositories.count,
-                    deferredRequests: deferredRequests
-                )
-            )
+            if isIdle() {
+                await onStatus(watching)
+            } else {
+                // The last worker to finish posts it, so the line does not say "Watching"
+                // over a review that is still running.
+                idleStatus = watching
+            }
+            if awaitCompletion {
+                await waitUntilIdle()
+            }
         } catch {
             await logger.append("Poll failed: \(error.localizedDescription)")
             await onStatus(error.localizedDescription)
@@ -224,6 +280,8 @@ actor ReviewEngine {
 
                     let reviewKey = "\(repository.githubSlug)#\(pullRequest.number)@\(metadata.headRefOid)@\(requestMarker)"
                     guard !reviewedState.contains(reviewKey) else { continue }
+                    // Already queued or being reviewed by an earlier poll's workers.
+                    guard !queuedKeys.contains(reviewKey) else { continue }
 
                     // A request that keeps failing is retried on a widening schedule and
                     // eventually abandoned, so a broken reviewer can't re-run the whole
@@ -268,7 +326,8 @@ actor ReviewEngine {
                             metadata: metadata,
                             repository: repository,
                             requestMarker: requestMarker,
-                            reviewKey: reviewKey
+                            reviewKey: reviewKey,
+                            configuration: configuration
                         )
                     )
                 } catch {
@@ -329,70 +388,79 @@ actor ReviewEngine {
         }
     }
 
-    /// Reviews everything this poll discovered, `configuration.maxConcurrentReviews`
-    /// at a time.
+    /// Adds the requests a poll discovered that are not already queued or running.
+    private func enqueue(_ pending: [PendingPullRequest]) {
+        for request in pending where !queuedKeys.contains(request.reviewKey) {
+            queuedKeys.insert(request.reviewKey)
+            queue.append(request)
+            batchTotal += 1
+        }
+    }
+
+    /// Starts workers for whatever is queued, up to `limit` running at once.
     ///
-    /// A review is minutes of CLI time, so reviewing a queue one pull request at a
-    /// time meant the newest request waited out every older one — a backlog of five
-    /// took five times as long as it needed to, with the machine idle in between. The
-    /// cap is the counterweight: each pull request runs *every* enabled reviewer, so
-    /// an unbounded fan-out would put a dozen CLI processes against the same API at
-    /// once.
-    private func runPendingReviews(
-        _ pendingReviews: [PendingPullRequest],
-        configuration: ReviewBotConfiguration,
+    /// The cap is the counterweight to running reviews at the same time at all: each
+    /// pull request runs *every* enabled reviewer, so an unbounded fan-out would put a
+    /// dozen CLI processes against the same API at once. A worker that finds the queue
+    /// empty when it gets to run simply exits, so over-starting is harmless.
+    private func startWorkers(
+        limit: Int,
+        onEvent: @escaping EventSink,
+        onStatus: @escaping StatusSink
+    ) {
+        let limit = max(1, limit)
+        var idle = queue.count
+        while workers < limit, idle > 0 {
+            workers += 1
+            idle -= 1
+            Task { await self.runWorker(onEvent: onEvent, onStatus: onStatus) }
+        }
+    }
+
+    private func runWorker(
         onEvent: @escaping EventSink,
         onStatus: @escaping StatusSink
     ) async {
-        guard !pendingReviews.isEmpty else { return }
-        let total = pendingReviews.count
-        let limit = max(1, min(configuration.maxConcurrentReviews, total))
-        // There is one status line and it can only describe one thing. A lone review
-        // narrates itself as before; a queue would just flicker between its members,
-        // so the poll reports the queue's progress instead and the per-pull-request
-        // detail stays in the menu bar queue and the history.
-        let announcesStatus = total == 1
-        if !announcesStatus {
-            await onStatus(Self.queueStatus(completed: 0, total: total))
-        }
-
-        var completed = 0
-        await withTaskGroup(of: Void.self) { group in
-            var inFlight = 0
-            for pendingReview in pendingReviews {
-                if inFlight == limit {
-                    _ = await group.next()
-                    inFlight -= 1
-                    completed += 1
-                    if !announcesStatus {
-                        await onStatus(Self.queueStatus(completed: completed, total: total))
-                    }
-                }
-                group.addTask {
-                    await self.review(
-                        pendingReview,
-                        configuration: configuration,
-                        announcesStatus: announcesStatus,
-                        onEvent: onEvent,
-                        onStatus: onStatus
-                    )
-                }
-                inFlight += 1
+        while !queue.isEmpty {
+            let next = queue.removeFirst()
+            // There is one status line and it can only describe one thing. A lone review
+            // narrates itself; a queue would just flicker between its members, so its
+            // progress is reported instead and the per-pull-request detail stays in the
+            // menu bar queue and the history.
+            let alone = workers == 1 && queue.isEmpty && batchTotal == 1
+            if !alone {
+                await onStatus(Self.queueStatus(completed: batchCompleted, total: batchTotal))
             }
-
-            while await group.next() != nil {
-                completed += 1
-                if !announcesStatus {
-                    await onStatus(Self.queueStatus(completed: completed, total: total))
-                }
+            await review(
+                next,
+                configuration: next.configuration,
+                announcesStatus: alone,
+                onEvent: onEvent,
+                onStatus: onStatus
+            )
+            queuedKeys.remove(next.reviewKey)
+            batchCompleted += 1
+            if !alone {
+                await onStatus(Self.queueStatus(completed: batchCompleted, total: batchTotal))
             }
         }
+        workers -= 1
+        guard workers == 0 else { return }
+        batchTotal = 0
+        batchCompleted = 0
+        if let idleStatus {
+            self.idleStatus = nil
+            await onStatus(idleStatus)
+        }
+        let waiters = idleWaiters
+        idleWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 
     private static func queueStatus(completed: Int, total: Int) -> String {
         completed == 0
-            ? "Reviewing \(total) pull requests…"
-            : "Reviewed \(completed) of \(total) pull requests…"
+            ? "Reviewing \(total) pull request\(total == 1 ? "" : "s")…"
+            : "Reviewed \(completed) of \(total) pull request\(total == 1 ? "" : "s")…"
     }
 
     /// - Parameter announcesStatus: whether this review owns the status line. False

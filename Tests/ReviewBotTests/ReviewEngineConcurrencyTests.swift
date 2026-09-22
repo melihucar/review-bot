@@ -86,6 +86,45 @@ final class ReviewEngineConcurrencyTests: XCTestCase {
         )
     }
 
+    /// A poll no longer waits for the reviews it queued, so the app keeps polling on its
+    /// interval while they run — and a request that arrives mid-queue is reviewed alongside
+    /// them instead of after the queue *and* the next interval.
+    func testARequestFoundWhileReviewsAreRunningJoinsTheQueue() async throws {
+        let fixture = try ConcurrencyFixture(concurrency: 3)
+        // #41's reviewer holds its slot until a second reviewer is running, so the only
+        // way it finishes before the deadline is for #42 to start while #41 is in flight.
+        let runner = MultiPullRequestMock(pullRequests: [41], expectedPeak: 2)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let events = EventLog()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            awaitCompletion: false,
+            onEvent: { await events.append($0) },
+            onStatus: { _ in }
+        )
+        let idleAfterFirstPoll = await engine.isIdle()
+        XCTAssertFalse(idleAfterFirstPoll, "the poll should return with #41 still under review")
+
+        await runner.setPullRequests([41, 42])
+        await engine.poll(
+            configuration: fixture.configuration,
+            awaitCompletion: false,
+            onEvent: { await events.append($0) },
+            onStatus: { _ in }
+        )
+        await engine.waitUntilIdle()
+
+        let peak = await runner.peakConcurrentReviewers()
+        XCTAssertEqual(peak, 2, "#42 should have run alongside #41 rather than after it")
+        let posted = await runner.postedPullRequests()
+        XCTAssertEqual(posted.sorted(), [41, 42])
+        let detected = await events.kinds(.requestDetected)
+        XCTAssertEqual(detected, [41, 42], "#41 was already queued, so the second poll must not announce it again")
+        let idle = await engine.isIdle()
+        XCTAssertTrue(idle)
+    }
+
     func testALoneReviewStillNarratesItself() async throws {
         let fixture = try ConcurrencyFixture(concurrency: 3)
         let runner = MultiPullRequestMock(pullRequests: [42], expectedPeak: 1)
@@ -133,6 +172,15 @@ private struct ConcurrencyFixture {
     }
 }
 
+private actor EventLog {
+    private var entries: [HistoryEntry] = []
+
+    func append(_ entry: HistoryEntry) { entries.append(entry) }
+    func kinds(_ kind: HistoryEventKind) -> [Int] {
+        entries.filter { $0.kind == kind }.compactMap(\.pullRequestNumber)
+    }
+}
+
 private actor StatusLog {
     private var values: [String] = []
 
@@ -152,7 +200,7 @@ private actor MultiPullRequestMock: CommandRunning {
     private var cloneWriters = 0
     private var cloneWriterPeak = 0
     private var posted: [Int] = []
-    private let pullRequests: [Int]
+    private var pullRequests: [Int]
 
     init(pullRequests: [Int], expectedPeak: Int) {
         self.pullRequests = pullRequests
@@ -162,6 +210,8 @@ private actor MultiPullRequestMock: CommandRunning {
     func peakConcurrentReviewers() -> Int { reviewerPeak }
     func peakConcurrentClonewriters() -> Int { cloneWriterPeak }
     func postedPullRequests() -> [Int] { posted }
+    /// What the next search lists — a request that "arrives" while reviews are running.
+    func setPullRequests(_ numbers: [Int]) { pullRequests = numbers }
 
     func run(
         _ executable: String,

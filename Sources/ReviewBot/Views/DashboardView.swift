@@ -62,7 +62,7 @@ private struct GeneralSettingsView: View {
                             model.runNow()
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.isRunning)
+                        .disabled(model.isPolling)
                     }
 
                     Divider()

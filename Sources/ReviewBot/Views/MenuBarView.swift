@@ -75,7 +75,10 @@ struct MenuBarView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(model.isRunning)
+            // Reviews run on behind a poll, and a poll can be asked for while they do —
+            // it queues whatever is new behind them. Only a check already in progress
+            // makes the button pointless.
+            .disabled(model.isPolling)
 
             Button {
                 model.togglePaused()

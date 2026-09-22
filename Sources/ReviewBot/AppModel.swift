@@ -7,7 +7,8 @@ import SwiftUI
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var status = "Starting…"
-    @Published private(set) var isRunning = false
+    /// A discovery pass is in progress. Reviews outlive it — see `isRunning`.
+    @Published private(set) var isPolling = false
     @Published private(set) var lastCheckDate: Date?
     @Published private(set) var toolAvailability: [String: Bool] = [:]
     @Published private(set) var reviewersWithSavedKey: Set<ReviewerName> = []
@@ -19,6 +20,11 @@ final class AppModel: ObservableObject {
     /// it was still running.
     @Published private(set) var runningReviews: [ReviewQueueItem] = []
     @Published var errorMessage: String?
+
+    /// Whether Review Bot is doing anything: discovering requests or reviewing one. The
+    /// two are separate now that a poll returns as soon as discovery is done and the
+    /// reviews run on behind it.
+    var isRunning: Bool { isPolling || !runningReviews.isEmpty }
 
     let settings: SettingsStore
     let history: HistoryStore
@@ -56,7 +62,7 @@ final class AppModel: ObservableObject {
     }
 
     func runNow() {
-        guard !isRunning else { return }
+        guard !isPolling else { return }
         Task { [weak self] in
             await self?.performPoll(manual: true)
         }
@@ -279,32 +285,45 @@ final class AppModel: ObservableObject {
             } else {
                 let interval = TimeInterval(max(1, settings.configuration.pollIntervalMinutes) * 60)
                 let pollIsDue = lastCheckDate.map { Date().timeIntervalSince($0) >= interval } ?? true
-                if pollIsDue, !isRunning {
+                // Polling is gated on discovery alone, not on the reviews: they keep
+                // running behind the poll, and a poll that finds a new request while
+                // they do simply queues it behind them.
+                if pollIsDue, !isPolling {
                     await performPoll()
                 }
             }
+            await reconcileQueueWithEngine()
 
             try? await Task.sleep(for: .seconds(2))
         }
     }
 
-    private func performPoll(manual: Bool = false) async {
-        guard !isRunning else { return }
-        isRunning = true
-        defer {
-            isRunning = false
-            lastCheckDate = Date()
-            // A poll reviews every request it discovers before returning, so nothing
-            // should remain queued afterward. Reset defensively so a missed or
-            // out-of-order terminal event can never leave a stale count in the menu bar.
+    /// Nothing should be shown as queued or running once the engine's queue is empty.
+    /// Reset defensively so a missed or out-of-order terminal event can never leave a
+    /// stale count in the menu bar.
+    private func reconcileQueueWithEngine() async {
+        guard !pendingReviews.isEmpty || !runningReviews.isEmpty else { return }
+        if await engine.isIdle() {
             pendingReviews.removeAll()
             runningReviews.removeAll()
         }
+    }
+
+    private func performPoll(manual: Bool = false) async {
+        guard !isPolling else { return }
+        isPolling = true
+        defer {
+            isPolling = false
+            lastCheckDate = Date()
+        }
 
         let configuration = settings.configuration
+        // Returns once discovery is done; the reviews it queued carry on and report
+        // through the same sinks.
         await engine.poll(
             configuration: configuration,
             manual: manual,
+            awaitCompletion: false,
             onEvent: { [weak self] entry in
                 await MainActor.run {
                     self?.history.append(entry)
