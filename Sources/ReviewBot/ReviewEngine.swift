@@ -1533,6 +1533,7 @@ actor ReviewEngine {
                     configuration: configuration,
                     credentials: credentials
                 ),
+                stopEarly: Self.stopOnTerminalFailure,
                 timeout: 900
             )
             let parsed = claudeOutput(result.stdout)
@@ -1677,6 +1678,7 @@ actor ReviewEngine {
                     configuration: configuration,
                     credentials: credentials
                 ),
+                stopEarly: Self.stopOnTerminalFailure,
                 timeout: 900
             )
             guard result.succeeded,
@@ -1734,6 +1736,13 @@ actor ReviewEngine {
                 "opencode",
                 arguments: [
                     "run",
+                    // opencode says nothing on its streams when a request fails — an
+                    // exhausted usage limit is logged to its own log file and the process
+                    // simply never exits (measured: fifteen minutes to the kill, every
+                    // review). Printing its error log to stderr is what lets the watch below
+                    // see the failure and stop the run in seconds.
+                    "--print-logs",
+                    "--log-level", "ERROR",
                     "--agent", "review-bot",
                     "--model", configuration.model,
                     "--variant", configuration.effort.rawValue,
@@ -1742,10 +1751,15 @@ actor ReviewEngine {
                 ],
                 currentDirectory: worktree,
                 environment: environment,
+                stopEarly: Self.stopOnTerminalFailure,
                 timeout: 900
             )
             guard result.succeeded else {
-                return failedReviewer(.opencode, configuration, message: conciseError(result))
+                return failedReviewer(
+                    .opencode,
+                    configuration,
+                    message: Self.opencodeFailure(from: conciseError(result))
+                )
             }
             return ReviewerResult(
                 reviewer: .opencode,
@@ -1757,6 +1771,30 @@ actor ReviewEngine {
         } catch {
             return failedReviewer(.opencode, configuration, error: error)
         }
+    }
+
+    /// The watch every CLI reviewer runs under: the moment a line of its output reads as a
+    /// terminal failure — an exhausted quota, a rejected login, an unusable model — the run is
+    /// stopped rather than left to its time limit. The classification is the same one that
+    /// decides the in-review retry, so a failure that stops a run early is also one that is
+    /// not retried, and the panel goes on without that reviewer within seconds.
+    static let stopOnTerminalFailure: OutputWatch = { line in
+        ReviewerFailureClass.classify(line) == .terminal
+    }
+
+    /// opencode's error log lines are `key=value` records ending in `error.error="…"`. The
+    /// quoted message is what the developer needs to read; the rest is noise in a posted
+    /// disclosure. Anything that is not such a line is returned as it came.
+    static func opencodeFailure(from message: String) -> String {
+        guard let pattern = try? NSRegularExpression(pattern: #"error\.error="([^"]*)""#) else { return message }
+        let whole = NSRange(message.startIndex..., in: message)
+        // The last record is the one the run ended on.
+        guard let match = pattern.matches(in: message, range: whole).last,
+              let range = Range(match.range(at: 1), in: message) else {
+            return message
+        }
+        let quoted = message[range].trimmingCharacters(in: .whitespaces)
+        return quoted.isEmpty ? message : quoted
     }
 
     /// Writes the read-only agent definition opencode runs reviewers under.
@@ -1826,6 +1864,8 @@ actor ReviewEngine {
                     "--prompt", prompt,
                 ],
                 currentDirectory: worktree,
+                environment: [:],
+                stopEarly: Self.stopOnTerminalFailure,
                 timeout: 900
             )
             guard result.succeeded else {

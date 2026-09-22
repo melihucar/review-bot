@@ -5,9 +5,21 @@ struct CommandResult {
     let exitCode: Int32
     let stdout: String
     let stderr: String
+    /// Review Bot ended the command itself because its output matched the caller's
+    /// `stopEarly` watch — see `OutputWatch`. Never `succeeded`.
+    var stoppedEarly = false
 
-    var succeeded: Bool { exitCode == 0 }
+    var succeeded: Bool { exitCode == 0 && !stoppedEarly }
 }
+
+/// Called with each line a command writes (stdout and stderr alike) while it runs. Returning
+/// `true` ends the command at once, and that line becomes the tail of the result's `stderr`.
+///
+/// This exists because a CLI can learn it will never finish and still not exit: opencode, told
+/// its usage limit is exceeded, logs the error and then sits until the time limit kills it —
+/// fifteen minutes per review, every review, with nothing on its streams to say why. The watch
+/// lets the caller name what "never finishing" looks like and stop paying for it.
+typealias OutputWatch = @Sendable (String) -> Bool
 
 /// Changes applied on top of the inherited environment. A `nil` value removes the variable,
 /// which is how a reviewer configured for session auth is kept from silently picking up an
@@ -32,6 +44,19 @@ protocol CommandRunning {
         arguments: [String],
         currentDirectory: URL?,
         environment: EnvironmentOverrides,
+        timeout: Int
+    ) async throws -> CommandResult
+
+    /// As above, with an `OutputWatch` that can end the command before its time limit. The
+    /// default implementation in the extension ignores the watch — so a wrapper around another
+    /// runner must forward this overload explicitly, or the watch is dropped silently and a
+    /// stuck reviewer waits out its whole limit again.
+    func run(
+        _ executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: EnvironmentOverrides,
+        stopEarly: OutputWatch?,
         timeout: Int
     ) async throws -> CommandResult
 }
@@ -66,15 +91,37 @@ extension CommandRunning {
             timeout: timeout
         )
     }
+
+    /// Runners with no way to watch output (test doubles, wrappers written before the watch
+    /// existed) inherit this: the command runs to completion or its limit, as before.
+    func run(
+        _ executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: EnvironmentOverrides,
+        stopEarly: OutputWatch?,
+        timeout: Int
+    ) async throws -> CommandResult {
+        try await run(
+            executable,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            timeout: timeout
+        )
+    }
 }
 
 enum CommandExecutionError: LocalizedError {
-    case timedOut(command: String, seconds: Int)
+    /// `detail` is the last line the command wrote before the limit fired, when there was one:
+    /// a CLI that printed why it was stuck and then hung leaves that reason in the failure.
+    case timedOut(command: String, seconds: Int, detail: String? = nil)
 
     var errorDescription: String? {
         switch self {
-        case let .timedOut(command, seconds):
+        case let .timedOut(command, seconds, detail):
             "Command timed out after \(seconds) seconds: \(command)"
+                + (detail.map { " — \($0)" } ?? "")
         }
     }
 }
@@ -233,12 +280,31 @@ struct ProcessRunner: CommandRunning {
         environment: EnvironmentOverrides,
         timeout: Int
     ) async throws -> CommandResult {
+        try await run(
+            executable,
+            arguments: arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            stopEarly: nil,
+            timeout: timeout
+        )
+    }
+
+    func run(
+        _ executable: String,
+        arguments: [String],
+        currentDirectory: URL?,
+        environment: EnvironmentOverrides,
+        stopEarly: OutputWatch?,
+        timeout: Int
+    ) async throws -> CommandResult {
         try await Task.detached(priority: .utility) {
             try runSynchronously(
                 executable,
                 arguments: arguments,
                 currentDirectory: currentDirectory,
                 environment: environment,
+                stopEarly: stopEarly,
                 timeout: timeout
             )
         }.value
@@ -249,6 +315,7 @@ struct ProcessRunner: CommandRunning {
         arguments: [String],
         currentDirectory: URL?,
         environment overrides: EnvironmentOverrides,
+        stopEarly: OutputWatch?,
         timeout: Int
     ) throws -> CommandResult {
         let temporaryDirectory = fileManager.temporaryDirectory
@@ -291,27 +358,118 @@ struct ProcessRunner: CommandRunning {
             overrides: overrides
         )
 
+        // The watch reads the output files as the child appends to them, one new line at a
+        // time, so a line is judged exactly once.
+        let watcher = stopEarly.map { OutputFileWatcher(files: [stdoutURL, stderrURL], watch: $0) }
+        let started = Date()
+
         try process.run()
+        var stoppedEarly = false
+        if let watcher {
+            // `perl` has `exec`ed the command by now, so the pid is the CLI's own and a
+            // signal reaches it directly. A polite stop first; a CLI that ignores it is
+            // killed a few seconds later. The alarm still bounds the whole run.
+            while process.isRunning {
+                Thread.sleep(forTimeInterval: 0.5)
+                if process.isRunning, watcher.shouldStop() {
+                    stoppedEarly = true
+                    process.terminate()
+                    var grace = 0
+                    while process.isRunning, grace < 10 {
+                        Thread.sleep(forTimeInterval: 0.5)
+                        grace += 1
+                    }
+                    if process.isRunning {
+                        kill(process.processIdentifier, SIGKILL)
+                    }
+                    break
+                }
+            }
+        }
         process.waitUntilExit()
         try? stdoutHandle.synchronize()
         try? stderrHandle.synchronize()
 
         let stdout = String(decoding: (try? Data(contentsOf: stdoutURL)) ?? Data(), as: UTF8.self)
-        let stderr = String(decoding: (try? Data(contentsOf: stderrURL)) ?? Data(), as: UTF8.self)
+        var stderr = String(decoding: (try? Data(contentsOf: stderrURL)) ?? Data(), as: UTF8.self)
         // Only the executable name is surfaced in errors and results. The argument
         // list can contain the full review prompt (plus any REVIEW.md and custom
         // instructions), which must never leak into a posted review, history, or logs.
         let displayCommand = executable
 
-        if process.terminationReason == .uncaughtSignal, process.terminationStatus == SIGALRM {
-            throw CommandExecutionError.timedOut(command: displayCommand, seconds: timeout)
+        if !stoppedEarly, process.terminationReason == .uncaughtSignal, process.terminationStatus == SIGALRM {
+            // What the command last said is the only clue to why it hung.
+            let lastLine = [stderr, stdout]
+                .flatMap { $0.split(whereSeparator: \.isNewline) }
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .last { !$0.isEmpty }
+            throw CommandExecutionError.timedOut(
+                command: displayCommand,
+                seconds: timeout,
+                detail: lastLine.map { String($0.suffix(300)) }
+            )
+        }
+
+        if stoppedEarly {
+            // Put the reason last, where `conciseError` reads a failure from.
+            let elapsed = Int(Date().timeIntervalSince(started).rounded())
+            stderr += "\nStopped after \(elapsed) s: \(watcher?.matchedLine ?? "output matched the stop condition")"
         }
 
         return CommandResult(
             command: displayCommand,
-            exitCode: process.terminationStatus,
+            exitCode: stoppedEarly ? max(1, process.terminationStatus) : process.terminationStatus,
             stdout: stdout,
-            stderr: stderr
+            stderr: stderr,
+            stoppedEarly: stoppedEarly
         )
+    }
+}
+
+/// Feeds the lines a running command appends to its output files to an `OutputWatch`.
+///
+/// Keeps a read offset and a partial-line buffer per file, so each line is offered once and
+/// only once it is complete. Called from the wait loop, on the thread that is waiting, so it
+/// needs no locking.
+final class OutputFileWatcher {
+    private struct Cursor {
+        var offset: UInt64 = 0
+        var partial = Data()
+    }
+
+    private let files: [URL]
+    private let watch: OutputWatch
+    private var cursors: [Cursor]
+    private(set) var matchedLine: String?
+
+    init(files: [URL], watch: @escaping OutputWatch) {
+        self.files = files
+        self.watch = watch
+        cursors = Array(repeating: Cursor(), count: files.count)
+    }
+
+    /// Reads whatever is new in every file and returns true as soon as a line matches.
+    func shouldStop() -> Bool {
+        if matchedLine != nil { return true }
+        for index in files.indices {
+            guard let handle = try? FileHandle(forReadingFrom: files[index]) else { continue }
+            defer { try? handle.close() }
+            try? handle.seek(toOffset: cursors[index].offset)
+            let data = (try? handle.readToEnd()) ?? Data()
+            guard !data.isEmpty else { continue }
+            cursors[index].offset += UInt64(data.count)
+            var buffer = cursors[index].partial + data
+            while let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let line = String(decoding: buffer[buffer.startIndex..<newline], as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                buffer.removeSubrange(buffer.startIndex...newline)
+                if !line.isEmpty, watch(line) {
+                    matchedLine = line
+                    return true
+                }
+            }
+            cursors[index].partial = buffer
+        }
+        return false
     }
 }

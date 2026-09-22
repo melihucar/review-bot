@@ -20,6 +20,44 @@ private func withoutPromptModelAndEffort(_ arguments: [String]) -> [String] {
 }
 
 final class ReviewEngineFeatureTests: XCTestCase {
+    /// opencode on an exhausted usage limit logs the error and never exits. With its error log
+    /// printed to stderr the run is stopped in seconds (`ProcessRunnerTests`); what this checks
+    /// is what the engine does with that failure: no second attempt — the limit is a settings
+    /// problem, not a transient — a review posted by the reviewer that finished, and a
+    /// disclosure that quotes the error rather than the whole `key=value` log record.
+    func testAnOpencodeUsageLimitIsNotRetriedAndIsDisclosedReadably() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            opencodeFailureMessage: #"timestamp=2026-09-22T14:38:21.364Z level=ERROR run=66116fcc message="stream error" providerID=opencode-go modelID=muse agent=review-bot error.error="AI_APICallError: Go usage limit exceeded""#
+                + "\nStopped after 4 s: timestamp=2026-09-22T14:38:21.364Z level=ERROR error.error=\"AI_APICallError: Go usage limit exceeded\""
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.opencode.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let opencodeRuns = await runner.opencodeCount()
+        XCTAssertEqual(opencodeRuns, 1, "a usage limit is terminal: the in-review retry must not spend it again")
+        let postCount = await runner.postCount()
+        XCTAssertEqual(postCount, 1, "Claude finished, so the review is posted without opencode")
+        let body = await runner.lastPostedBody()
+        XCTAssertTrue(body.contains("Go usage limit exceeded"), body)
+        XCTAssertFalse(body.contains("timestamp="), "the disclosure should quote the error, not the log record: \(body)")
+        let arguments = await runner.lastOpencodeArguments()
+        XCTAssertTrue(arguments.contains("--print-logs"), "without its log on stderr opencode's failure is invisible: \(arguments)")
+        XCTAssertEqual(arguments.firstIndex(of: "--log-level").map { arguments[$0 + 1] }, "ERROR")
+    }
+
+    func testOpencodeLogRecordsAreReducedToTheirErrorMessage() {
+        XCTAssertEqual(
+            ReviewEngine.opencodeFailure(from: #"timestamp=x level=ERROR message="stream error" error.error="AI_APICallError: Go usage limit exceeded""#),
+            "AI_APICallError: Go usage limit exceeded"
+        )
+        XCTAssertEqual(ReviewEngine.opencodeFailure(from: "plain failure text"), "plain failure text")
+        XCTAssertEqual(ReviewEngine.opencodeFailure(from: #"error.error="""#), #"error.error="""#)
+    }
+
     func testCleanReviewRunsInWorktreeUsesRepositoryRulesAndPostsApproval() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock()
@@ -2480,6 +2518,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var claudeArgumentLists: [[String]] = []
     private var codexRuns = 0
     private var opencodeRuns = 0
+    private var opencodeArguments: [String] = []
     private var geminiRuns = 0
     private var geminiArgs: [String] = []
     /// The worktree's `.gemini/settings.json` and `.env` as they stood the moment `gemini`
@@ -2561,6 +2600,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// anything reads it back.
     private var trackingRefs: [String: String]
     private let headRefOidAfterReview: String?
+    private let opencodeFailureMessage: String?
     private let failHeadRecheck: Bool
     private var baseTreeDiffArgs: [String]?
     private var mergeTreeCalls = 0
@@ -2593,6 +2633,8 @@ private actor ReviewWorkflowMock: CommandRunning {
         conversationText: String = "PR conversation",
         claudeBody: String = "Looks safe.",
         opencodeBody: String = "opencode result.",
+        /// When set, `opencode` exits non-zero with this on stderr instead of reviewing.
+        opencodeFailureMessage: String? = nil,
         /// Wraps the review in the envelope `claude --output-format json` really returns, which
         /// is where the CLI reports its tokens and its cost.
         claudeEmitsJSONEnvelope: Bool = false,
@@ -2654,6 +2696,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         spawnClock: ReviewerSpawnClock? = nil
     ) {
         self.spawnClock = spawnClock
+        self.opencodeFailureMessage = opencodeFailureMessage
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
         self.codexVerdict = codexVerdict
@@ -3027,6 +3070,10 @@ private actor ReviewWorkflowMock: CommandRunning {
             }
             opencodeRuns += 1
             anyReviewerInvoked = true
+            opencodeArguments = arguments
+            if let opencodeFailureMessage {
+                return result(exitCode: 1, stderr: opencodeFailureMessage)
+            }
             return result(stdout: "## Summary\n\(opencodeBody)\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
         }
         if executable == "gemini" {
@@ -3078,6 +3125,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func claudeInvocations() -> [[String]] { claudeArgumentLists }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
+    func lastOpencodeArguments() -> [String] { opencodeArguments }
     func geminiCount() -> Int { geminiRuns }
     func geminiInvocation() -> [String] { geminiArgs }
     func geminiWorkspaceSettingsAtInvocation() -> String? { geminiWorkspaceSettings }

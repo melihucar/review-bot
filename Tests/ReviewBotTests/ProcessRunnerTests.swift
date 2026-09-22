@@ -126,4 +126,71 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertEqual(composed["HOME"], home)
         XCTAssertEqual(composed["PATH"], minimalPath)
     }
+
+    // MARK: - Stopping a command on its own output
+
+    // Real processes through the real runner: `sh` and `perl` are on every macOS runner.
+    // A stuck CLI that has already said why it will never finish is the case these exist
+    // for, so the scripts print the reason and then sleep past what the test can wait.
+
+    func testACommandWhoseOutputMatchesTheWatchIsStoppedWithinSeconds() async throws {
+        let runner = ProcessRunner()
+        let started = Date()
+
+        let result = try await runner.run(
+            "sh",
+            arguments: ["-c", "echo 'level=ERROR error.error=\"Go usage limit exceeded\"' >&2; sleep 30; echo late"],
+            currentDirectory: nil,
+            environment: [:],
+            stopEarly: ReviewEngine.stopOnTerminalFailure,
+            timeout: 60
+        )
+
+        XCTAssertLessThan(Date().timeIntervalSince(started), 15, "the command should be stopped long before its limit")
+        XCTAssertTrue(result.stoppedEarly)
+        XCTAssertFalse(result.succeeded, "a stopped command must read as a failure, whatever its exit code")
+        XCTAssertTrue(result.stderr.contains("Stopped after"), result.stderr)
+        XCTAssertTrue(result.stderr.contains("usage limit exceeded"), "the matched line is the failure's reason: \(result.stderr)")
+        XCTAssertFalse(result.stdout.contains("late"))
+    }
+
+    func testOutputThatDoesNotMatchLeavesTheCommandAlone() async throws {
+        let runner = ProcessRunner()
+
+        let result = try await runner.run(
+            "sh",
+            arguments: ["-c", "echo 'working'; echo 'nearly there' >&2; echo done"],
+            currentDirectory: nil,
+            environment: [:],
+            stopEarly: ReviewEngine.stopOnTerminalFailure,
+            timeout: 30
+        )
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertFalse(result.stoppedEarly)
+        XCTAssertTrue(result.stdout.contains("done"))
+    }
+
+    func testATimeoutCarriesTheLastLineTheCommandWrote() async throws {
+        let runner = ProcessRunner()
+
+        do {
+            _ = try await runner.run(
+                "sh",
+                arguments: ["-c", "echo 'retrying in 30s' >&2; sleep 20"],
+                currentDirectory: nil,
+                environment: [:],
+                timeout: 1
+            )
+            XCTFail("expected a timeout")
+        } catch let error as CommandExecutionError {
+            guard case let .timedOut(command, seconds, detail) = error else {
+                return XCTFail("expected a timeout, got \(error)")
+            }
+            XCTAssertEqual(command, "sh")
+            XCTAssertEqual(seconds, 1)
+            XCTAssertEqual(detail, "retrying in 30s")
+            XCTAssertTrue(error.localizedDescription.contains("retrying in 30s"), error.localizedDescription)
+        }
+    }
 }
