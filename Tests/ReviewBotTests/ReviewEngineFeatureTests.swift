@@ -1250,6 +1250,63 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(decision?.usage?.outputTokens, 200)
     }
 
+    /// Regression test for a live outage. Claude Code 2.1.280 changed `--output-format json`
+    /// from the result envelope alone to the whole event stream as a JSON array with the
+    /// envelope last. That does not decode as a single object, so the review was read as raw
+    /// stdout instead — sixteen kilobytes of JSON with no trailing `VERDICT:` line anywhere in
+    /// it. The reviewer was recorded as having produced nothing and dropped from the panel,
+    /// twice per review once the in-review retry had re-run and re-paid for the same answer,
+    /// leaving a partial panel that may not approve: every review came back a neutral comment
+    /// with its verdict sitting correctly parsed inside the discarded JSON, and the spend of
+    /// both calls went unrecorded. The two shapes must be indistinguishable to the engine.
+    func testClaudeEventStreamOutputIsReadTheSameAsABareEnvelope() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeEmitsJSONEnvelope: true,
+            claudeWrapsEnvelopeInEventStream: true
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant"])
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let postedBody = await runner.lastPostedBody()
+        let events = await recorder.snapshot()
+
+        // The verdict inside the envelope has to be honoured, so the panel is whole and can
+        // reach a real decision rather than withholding approval from a reviewer it thinks
+        // returned nothing.
+        let decision = try XCTUnwrap(events.last)
+        XCTAssertEqual(decision.kind, .approved)
+        XCTAssertFalse(
+            events.contains { ($0.message).localizedCaseInsensitiveContains("unavailable") },
+            "Claude answered; no event may describe it as unavailable"
+        )
+        // Exactly one run: a verdict was found the first time, so nothing was retried.
+        let claudeRuns = await runner.claudeCount()
+        XCTAssertEqual(claudeRuns, 1)
+
+        // The envelope is still unwrapped for its text and its cost, and the surrounding event
+        // stream must never reach the pull request.
+        XCTAssertTrue(postedBody.contains("Looks safe."))
+        XCTAssertFalse(postedBody.contains("rate_limit_event"))
+        XCTAssertFalse(postedBody.contains("total_cost_usd"))
+        XCTAssertEqual(decision.usage?.costUSD, 0.1234)
+        XCTAssertEqual(decision.usage?.inputTokens, 1_500)
+        XCTAssertEqual(decision.usage?.cachedInputTokens, 5_000)
+        XCTAssertEqual(decision.usage?.outputTokens, 200)
+    }
+
     /// A reviewer that returns no verdict is run again inside the same review, and for a metered
     /// reviewer the discarded attempt was billed all the same. Keeping only the second attempt's
     /// figure reports a retried review at roughly half what it cost.
@@ -2571,6 +2628,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let claudeBody: String
     private let opencodeBody: String
     private let claudeEmitsJSONEnvelope: Bool
+    /// Wraps that envelope in the JSON event array newer CLIs return it inside.
+    private let claudeWrapsEnvelopeInEventStream: Bool
     private let claudeRunsWithoutVerdict: Int
     private let claudeFailingRuns: Int
     private let baseCommitsAhead: Int
@@ -2640,6 +2699,9 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// Wraps the review in the envelope `claude --output-format json` really returns, which
         /// is where the CLI reports its tokens and its cost.
         claudeEmitsJSONEnvelope: Bool = false,
+        /// Returns the JSON envelope as the last element of the CLI's event
+        /// array, the way Claude Code 2.1.280 does, instead of on its own.
+        claudeWrapsEnvelopeInEventStream: Bool = false,
         /// How many of the leading `claude` review runs omit the trailing `VERDICT:` line. A
         /// reviewer that finishes without a verdict is retried inside the same review, so this
         /// is how the retry path is reached without a failure to muddy what is being measured.
@@ -2721,6 +2783,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.claudeBody = claudeBody
         self.opencodeBody = opencodeBody
         self.claudeEmitsJSONEnvelope = claudeEmitsJSONEnvelope
+        self.claudeWrapsEnvelopeInEventStream = claudeWrapsEnvelopeInEventStream
         self.claudeRunsWithoutVerdict = claudeRunsWithoutVerdict
         self.claudeFailingRuns = claudeFailingRuns
         self.baseCommitsAhead = baseCommitsAhead
@@ -3054,7 +3117,17 @@ private actor ReviewWorkflowMock: CommandRunning {
                     "cache_creation_input_tokens": 500,
                 ],
             ]
-            let data = try JSONSerialization.data(withJSONObject: envelope)
+            // Claude Code 2.1.280 answers `--output-format json` with the whole event stream
+            // as a JSON array, the envelope last, rather than the envelope on its own.
+            let payload: Any = claudeWrapsEnvelopeInEventStream
+                ? [
+                    ["type": "system", "subtype": "init", "session_id": "test-session"],
+                    ["type": "assistant", "message": ["role": "assistant", "content": []]],
+                    ["type": "rate_limit_event", "rate_limit": ["status": "allowed"]],
+                    envelope,
+                ] as [Any]
+                : envelope
+            let data = try JSONSerialization.data(withJSONObject: payload)
             return result(
                 exitCode: failed ? 1 : 0,
                 stdout: String(decoding: data, as: UTF8.self)

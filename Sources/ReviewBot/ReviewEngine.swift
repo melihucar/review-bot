@@ -1675,10 +1675,8 @@ actor ReviewEngine {
     /// review to guard against a CLI nobody has reported. Cost comes straight from the CLI, so
     /// there is no price table to keep current.
     private func claudeOutput(_ stdout: String) -> CLIReviewOutput {
-        guard let envelope = try? JSONDecoder().decode(
-            ClaudeResultEnvelope.self,
-            from: Data(stdout.utf8)
-        ), let result = envelope.result else {
+        guard let envelope = Self.claudeResultEnvelope(in: Data(stdout.utf8)),
+              let result = envelope.result else {
             return CLIReviewOutput(text: stdout, usage: nil, failure: nil, parsedEnvelope: false)
         }
 
@@ -1700,6 +1698,43 @@ actor ReviewEngine {
                 : nil,
             parsedEnvelope: true
         )
+    }
+
+    /// The result envelope from a `--output-format json` run, however the CLI chose to wrap it.
+    ///
+    /// It used to answer with the envelope alone. Claude Code 2.1.280 answers with the whole
+    /// event stream as a JSON array — `system`, `assistant`, `rate_limit_event`, … and finally
+    /// the `result` element — which does not decode as a single object, so the review fell back
+    /// to being read as raw stdout: sixteen kilobytes of JSON with no trailing `VERDICT:` line
+    /// in it. The reviewer was then recorded as having produced no verdict and dropped from the
+    /// panel, twice per review (the in-review retry re-ran and re-paid for the same result),
+    /// leaving a partial panel that may not approve. Every review came back as a neutral
+    /// comment while the verdict sat correctly parsed inside the discarded JSON.
+    ///
+    /// Both shapes are accepted, since which one arrives depends on the CLI the developer
+    /// happens to have installed. The element is isolated with `JSONSerialization` and decoded
+    /// on its own rather than the array being decoded as `[ClaudeResultEnvelope]`: the sibling
+    /// events have entirely different shapes, and one of them failing to decode would take the
+    /// result down with it.
+    private static func claudeResultEnvelope(in data: Data) -> ClaudeResultEnvelope? {
+        if let single = try? JSONDecoder().decode(ClaudeResultEnvelope.self, from: data),
+           single.result != nil {
+            return single
+        }
+        guard let events = (try? JSONSerialization.jsonObject(with: data)) as? [Any] else {
+            return nil
+        }
+        // Last rather than first: a run that emits several `result` elements has the final one
+        // as its answer.
+        for event in events.reversed() {
+            guard let object = event as? [String: Any],
+                  object["type"] as? String == "result",
+                  let elementData = try? JSONSerialization.data(withJSONObject: object),
+                  let envelope = try? JSONDecoder().decode(ClaudeResultEnvelope.self, from: elementData)
+            else { continue }
+            return envelope
+        }
+        return nil
     }
 
     private struct ClaudeResultEnvelope: Decodable {
