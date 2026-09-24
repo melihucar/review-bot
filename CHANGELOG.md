@@ -11,6 +11,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-24
+
 ### Added
 
 - **"Report issue" on a failed review, prefilled.** Every failure in Dashboard → History now carries a link that opens a GitHub issue already filled in: what failed and on which pull request, the verbatim error, the app version and OS, which reviewer CLIs are on the machine and which are enabled with which model, the poll interval, concurrency cap, failure budget and review scope, and where to find that day's log. The full report also goes to the clipboard, because GitHub refuses a request line past roughly 8 KB and a long failure message does not fit in a URL — the link carries as much as fits under that budget and says so where it was cut. Review Bot does not file the issue itself: the report necessarily names the repository and pull request the failure came from, and those are usually private, so the prefilled form is the step where you get to read it before anything is sent.
@@ -237,7 +239,8 @@ behaviour; every other reviewer works exactly as it did in 0.1.16.
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/melihucar/review-bot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/melihucar/review-bot/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/melihucar/review-bot/compare/v0.1.16...v0.2.0
 [0.1.17-rc.1]: https://github.com/melihucar/review-bot/compare/v0.1.16...v0.1.17-rc.1
