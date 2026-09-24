@@ -1021,6 +1021,39 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(usedGhDiff, "First review of a PR should use the full PR diff")
     }
 
+    /// The bug this guards against: `gh pr diff` refuses any pull request touching more than 300
+    /// files with an HTTP 406, and — before `fullPullRequestDiff` existed — that failure burned
+    /// the whole review's retry budget on every poll until the request was abandoned, so a
+    /// 300+ file pull request was never reviewed at all. `checkOutPullRequest` already fetched
+    /// both the head and the base into the clone before this runs, so the fallback computes the
+    /// identical three-dot diff locally instead of giving up.
+    func testGhPrDiffFailureFallsBackToTheLocalThreeDotDiff() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failGhPrDiff: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postCount = await runner.postCount()
+        let threeDotDiff = await runner.threeDotDiffInvocation()
+        let diffSeenByReviewer = await runner.diffPatchDuringReview()
+        XCTAssertEqual(postCount, 1, "A 300+ file pull request must still get reviewed, via the local fallback")
+        XCTAssertFalse(events.contains { $0.kind == .failed })
+        XCTAssertTrue(events.contains { $0.kind == .approved })
+        XCTAssertNotNil(threeDotDiff, "the local three-dot diff must actually run when gh pr diff fails")
+        let patch = try XCTUnwrap(diffSeenByReviewer)
+        XCTAssertTrue(
+            patch.contains("manyfiles/file1.swift"),
+            "the reviewer must see the locally-computed diff, not an empty or missing patch"
+        )
+    }
+
     // MARK: - Per-reviewer credentials
 
     func testAPIKeyAuthInjectsTheSavedKeyIntoTheReviewerProcess() async throws {
@@ -1215,6 +1248,63 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(decision?.usage?.inputTokens, 1_500)
         XCTAssertEqual(decision?.usage?.cachedInputTokens, 5_000)
         XCTAssertEqual(decision?.usage?.outputTokens, 200)
+    }
+
+    /// Regression test for a live outage. Claude Code 2.1.280 changed `--output-format json`
+    /// from the result envelope alone to the whole event stream as a JSON array with the
+    /// envelope last. That does not decode as a single object, so the review was read as raw
+    /// stdout instead — sixteen kilobytes of JSON with no trailing `VERDICT:` line anywhere in
+    /// it. The reviewer was recorded as having produced nothing and dropped from the panel,
+    /// twice per review once the in-review retry had re-run and re-paid for the same answer,
+    /// leaving a partial panel that may not approve: every review came back a neutral comment
+    /// with its verdict sitting correctly parsed inside the discarded JSON, and the spend of
+    /// both calls went unrecorded. The two shapes must be indistinguishable to the engine.
+    func testClaudeEventStreamOutputIsReadTheSameAsABareEnvelope() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeEmitsJSONEnvelope: true,
+            claudeWrapsEnvelopeInEventStream: true
+        )
+        let engine = ReviewEngine(
+            paths: fixture.paths,
+            runner: runner,
+            credentials: InMemoryCredentialStore(keys: [.claude: "sk-ant"])
+        )
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.authMode = .apiKey
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let postedBody = await runner.lastPostedBody()
+        let events = await recorder.snapshot()
+
+        // The verdict inside the envelope has to be honoured, so the panel is whole and can
+        // reach a real decision rather than withholding approval from a reviewer it thinks
+        // returned nothing.
+        let decision = try XCTUnwrap(events.last)
+        XCTAssertEqual(decision.kind, .approved)
+        XCTAssertFalse(
+            events.contains { ($0.message).localizedCaseInsensitiveContains("unavailable") },
+            "Claude answered; no event may describe it as unavailable"
+        )
+        // Exactly one run: a verdict was found the first time, so nothing was retried.
+        let claudeRuns = await runner.claudeCount()
+        XCTAssertEqual(claudeRuns, 1)
+
+        // The envelope is still unwrapped for its text and its cost, and the surrounding event
+        // stream must never reach the pull request.
+        XCTAssertTrue(postedBody.contains("Looks safe."))
+        XCTAssertFalse(postedBody.contains("rate_limit_event"))
+        XCTAssertFalse(postedBody.contains("total_cost_usd"))
+        XCTAssertEqual(decision.usage?.costUSD, 0.1234)
+        XCTAssertEqual(decision.usage?.inputTokens, 1_500)
+        XCTAssertEqual(decision.usage?.cachedInputTokens, 5_000)
+        XCTAssertEqual(decision.usage?.outputTokens, 200)
     }
 
     /// A reviewer that returns no verdict is run again inside the same review, and for a metered
@@ -2500,6 +2590,9 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var ghPrDiffCalled = false
     private var timelineCalls = 0
     private var incrementalDiffArgs: [String]?
+    /// The local three-dot (`<base>...<head>`) diff `fullPullRequestDiff` falls back to once
+    /// `gh pr diff` refuses the pull request. `nil` until that fallback actually runs.
+    private var threeDotDiffArgs: [String]?
     private var commandLog: [[String]] = []
     /// Flips true once any ordinary reviewer (claude in its non-reconciliation role, codex,
     /// or opencode) has been invoked — used to make the `gh pr view --json` head answer
@@ -2508,6 +2601,10 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// The merge preview as the reviewer saw it, captured at the moment `claude` was invoked —
     /// non-`nil` only when the file was actually present in the worktree by then.
     private var mergePreviewText: String?
+    /// `.review-bot-diff.patch` as the reviewer saw it, captured at the same moment. Proves the
+    /// locally-computed fallback diff actually reached the reviewer, not merely that some code
+    /// produced it.
+    private var diffPatchText: String?
     /// The overrides each executable was handed, keyed by executable rather than one stored
     /// property per reviewer: opencode's sandbox variables and the CLI reviewers' auth overrides
     /// now come through the same seam, and a reviewer added later records itself for free.
@@ -2531,6 +2628,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let claudeBody: String
     private let opencodeBody: String
     private let claudeEmitsJSONEnvelope: Bool
+    /// Wraps that envelope in the JSON event array newer CLIs return it inside.
+    private let claudeWrapsEnvelopeInEventStream: Bool
     private let claudeRunsWithoutVerdict: Int
     private let claudeFailingRuns: Int
     private let baseCommitsAhead: Int
@@ -2543,6 +2642,10 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let plantsHostileAgentConfiguration: Bool
     private let plantedContextFiles: [String: String]
     private let codexWritesNoOutput: Bool
+    /// Simulates GitHub's real refusal of a pull request touching more than 300 files: `gh pr
+    /// diff` fails with the exact HTTP 406 text GitHub sends, and `fullPullRequestDiff` must
+    /// fall back to a locally-computed three-dot diff rather than abandon the review.
+    private let failGhPrDiff: Bool
     /// Shared with a credential store so a test can tell whether keys were resolved before or
     /// after the reviewers fanned out. `nil` for every test that does not care.
     private let spawnClock: ReviewerSpawnClock?
@@ -2596,6 +2699,9 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// Wraps the review in the envelope `claude --output-format json` really returns, which
         /// is where the CLI reports its tokens and its cost.
         claudeEmitsJSONEnvelope: Bool = false,
+        /// Returns the JSON envelope as the last element of the CLI's event
+        /// array, the way Claude Code 2.1.280 does, instead of on its own.
+        claudeWrapsEnvelopeInEventStream: Bool = false,
         /// How many of the leading `claude` review runs omit the trailing `VERDICT:` line. A
         /// reviewer that finishes without a verdict is retried inside the same review, so this
         /// is how the retry path is reached without a failure to muddy what is being measured.
@@ -2651,6 +2757,10 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// A `codex` run that exits 0 without writing the file named by `-o`. Whatever already
         /// sits at that path is then what the engine reads back as codex's review.
         codexWritesNoOutput: Bool = false,
+        /// Simulates GitHub's real refusal of a pull request touching more than 300 files:
+        /// `gh pr diff` fails with the exact HTTP 406 text GitHub sends, and `fullPullRequestDiff`
+        /// must fall back to a locally-computed three-dot diff rather than abandon the review.
+        failGhPrDiff: Bool = false,
         spawnClock: ReviewerSpawnClock? = nil
     ) {
         self.spawnClock = spawnClock
@@ -2673,6 +2783,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.claudeBody = claudeBody
         self.opencodeBody = opencodeBody
         self.claudeEmitsJSONEnvelope = claudeEmitsJSONEnvelope
+        self.claudeWrapsEnvelopeInEventStream = claudeWrapsEnvelopeInEventStream
         self.claudeRunsWithoutVerdict = claudeRunsWithoutVerdict
         self.claudeFailingRuns = claudeFailingRuns
         self.baseCommitsAhead = baseCommitsAhead
@@ -2692,6 +2803,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.plantsHostileAgentConfiguration = plantsHostileAgentConfiguration
         self.plantedContextFiles = plantedContextFiles
         self.codexWritesNoOutput = codexWritesNoOutput
+        self.failGhPrDiff = failGhPrDiff
     }
 
     /// A `SessionStart` hook and an MCP server: the two `settings.json` entries Gemini CLI
@@ -2872,6 +2984,19 @@ private actor ReviewWorkflowMock: CommandRunning {
         if executable == "git", arguments.contains("diff"), arguments.contains("--") {
             return result(stdout: "diff --git a/shared.swift b/shared.swift\n+let addedOnBase = 1\n")
         }
+        // The 300+ file fallback: `gh pr diff` refuses those, so `fullPullRequestDiff` computes
+        // the identical three-dot (base...head) diff locally instead. Matched on the `...` that
+        // only that range argument carries, and this must precede the generic `git diff`
+        // catch-all right below — which exists for the *incremental*-scope diff and would
+        // otherwise swallow this call and record it as though it were that one.
+        if executable == "git", arguments.contains("diff"),
+           arguments.contains(where: { $0.contains("...") }) {
+            threeDotDiffArgs = arguments
+            return result(
+                stdout: "diff --git a/manyfiles/file1.swift b/manyfiles/file1.swift\n"
+                    + "+line from the local three-dot diff\n"
+            )
+        }
 
         if executable == "git", arguments.contains("diff") {
             incrementalDiffArgs = arguments
@@ -2879,6 +3004,14 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "gh", arguments.starts(with: ["pr", "diff", "42"]) {
             ghPrDiffCalled = true
+            if failGhPrDiff {
+                return result(
+                    exitCode: 1,
+                    stderr: "HTTP 406: Sorry, the diff exceeded the maximum number of files (300). "
+                        + "Consider using 'List pull requests files' API or locally cloning the "
+                        + "repository instead."
+                )
+            }
             return result(stdout: "diff --git a/a.swift b/a.swift\n")
         }
         if executable == "gh", arguments.starts(with: ["pr", "view", "42"]),
@@ -2948,6 +3081,10 @@ private actor ReviewWorkflowMock: CommandRunning {
                     contentsOf: currentDirectory.appendingPathComponent(".review-bot-merge.md"),
                     encoding: .utf8
                 )
+                diffPatchText = try? String(
+                    contentsOf: currentDirectory.appendingPathComponent(".review-bot-diff.patch"),
+                    encoding: .utf8
+                )
             }
             if failClaude {
                 return result(exitCode: 1, stderr: claudeFailureMessage)
@@ -2980,7 +3117,17 @@ private actor ReviewWorkflowMock: CommandRunning {
                     "cache_creation_input_tokens": 500,
                 ],
             ]
-            let data = try JSONSerialization.data(withJSONObject: envelope)
+            // Claude Code 2.1.280 answers `--output-format json` with the whole event stream
+            // as a JSON array, the envelope last, rather than the envelope on its own.
+            let payload: Any = claudeWrapsEnvelopeInEventStream
+                ? [
+                    ["type": "system", "subtype": "init", "session_id": "test-session"],
+                    ["type": "assistant", "message": ["role": "assistant", "content": []]],
+                    ["type": "rate_limit_event", "rate_limit": ["status": "allowed"]],
+                    envelope,
+                ] as [Any]
+                : envelope
+            let data = try JSONSerialization.data(withJSONObject: payload)
             return result(
                 exitCode: failed ? 1 : 0,
                 stdout: String(decoding: data, as: UTF8.self)
@@ -3110,6 +3257,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
     func timelineCallCount() -> Int { timelineCalls }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
+    func threeDotDiffInvocation() -> [String]? { threeDotDiffArgs }
+    func diffPatchDuringReview() -> String? { diffPatchText }
     func baseTreeDiffInvocation() -> [String]? { baseTreeDiffArgs }
     func mergeTreeCallCount() -> Int { mergeTreeCalls }
 

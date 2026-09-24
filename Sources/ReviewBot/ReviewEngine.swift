@@ -580,6 +580,7 @@ actor ReviewEngine {
                 adjudication: adjudication,
                 guardReason: guardReason,
                 approvalWithheldForPartialPanel: approvalWithheld,
+                diffTruncation: context.diffTruncation,
                 usageReport: usageReport(
                     results: results,
                     adjudication: adjudicationSpend,
@@ -928,11 +929,97 @@ actor ReviewEngine {
             .last ?? fallback
     }
 
+    /// The whole pull request's diff, from GitHub when it will serve it and from the local
+    /// clone when it will not.
+    ///
+    /// GitHub refuses the `.diff` media type for a pull request touching more than 300 files,
+    /// and `gh pr diff` surfaces that refusal verbatim: *"HTTP 406: Sorry, the diff exceeded
+    /// the maximum number of files (300). Consider using 'List pull requests files' API or
+    /// locally cloning the repository instead."* That is not a transient failure — it is the
+    /// same answer on every poll — so before this fallback existed a large pull request spent
+    /// its whole retry budget re-asking for a diff GitHub was never going to send, and was
+    /// then abandoned without ever being reviewed.
+    ///
+    /// The advice in GitHub's own message is already satisfied: `checkOutPullRequest` runs
+    /// immediately before this and fetches both the pull request head and the base branch into
+    /// the clone, so the three-dot diff can be computed locally, where no file-count cap
+    /// applies. GitHub stays the primary source anyway — it is the rendering the author sees,
+    /// and the overwhelming majority of pull requests are nowhere near the cap — so the local
+    /// clone is consulted only once `gh` has actually failed.
+    private func fullPullRequestDiff(
+        number: Int,
+        repository: RepositoryConfiguration,
+        metadata: PullRequestMetadata
+    ) async throws -> String {
+        let remote = try await runner.run(
+            "gh",
+            arguments: ["pr", "diff", String(number), "--repo", repository.githubSlug],
+            timeout: 120
+        )
+        if remote.succeeded {
+            return remote.stdout
+        }
+
+        let remoteFailure = conciseError(remote)
+        let base = await resolvedBaseCommit(repository: repository, metadata: metadata)
+        let local = try? await runner.run(
+            "git",
+            arguments: [
+                "-C", repository.path,
+                "diff", "--no-color", "\(base)...\(metadata.headRefOid)",
+            ],
+            timeout: 180
+        )
+        guard let local, local.succeeded, !local.stdout.isEmpty else {
+            throw ReviewEngineError.commandFailed(
+                "Could not download the PR diff: \(remoteFailure). Computing it from the local "
+                    + "clone instead did not work either"
+                    + (local.map { ": \(conciseError($0))" } ?? ".")
+            )
+        }
+        await logger.append(
+            "PR \(repository.githubSlug)#\(number): gh could not serve the diff (\(remoteFailure)); "
+                + "used the local clone's \(base.prefix(8))...\(metadata.headRefOid.prefix(8)) diff instead."
+        )
+        return local.stdout
+    }
+
+    /// The commit the pull request is diffed and compared against.
+    ///
+    /// `baseRefOid` is a snapshot GitHub took of the base ref, not its live tip. Once an author
+    /// merges the base branch in, that snapshot becomes an ancestor of the head, so callers
+    /// measuring drift against it see none — precisely in the case they exist for, since a
+    /// branch that has been synced once is the one most likely to drift again.
+    /// `checkOutPullRequest` fetches the base into `refs/remotes/origin/<name>` immediately
+    /// before either caller runs, so prefer that ref and fall back to the snapshot only when it
+    /// will not resolve (an unusual remote layout, or a base branch deleted since the fetch).
+    private func resolvedBaseCommit(
+        repository: RepositoryConfiguration,
+        metadata: PullRequestMetadata
+    ) async -> String {
+        let tracked = try? await runner.run(
+            "git",
+            arguments: [
+                "-C", repository.path,
+                "rev-parse", "--verify", "--quiet",
+                "refs/remotes/origin/\(metadata.baseRefName)^{commit}",
+            ],
+            timeout: 60
+        )
+        guard let tracked, tracked.succeeded else { return metadata.baseRefOid }
+        let oid = tracked.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return oid.isEmpty ? metadata.baseRefOid : oid
+    }
+
     /// The untrusted text the reviewers will read: the PR thread and the diff.
     /// `InjectionGuard` scans both for planted verdicts before an approval may post.
     private struct ReviewContext {
         let thread: String
         let diff: String
+        /// What `DiffBudget` had to leave out of the patch the reviewers read, so the posted
+        /// review can say so. A decision reached on part of a diff is a weaker signal than one
+        /// reached on all of it, and that is invisible from GitHub unless it is disclosed.
+        let diffTruncation: DiffBudget.Outcome
     }
 
     private func prepareReviewContext(
@@ -956,20 +1043,26 @@ actor ReviewEngine {
         if let narrowedDiff {
             diffText = narrowedDiff
         } else {
-            let diff = try await runner.run(
-                "gh",
-                arguments: ["pr", "diff", String(number), "--repo", repository.githubSlug],
-                timeout: 120
+            diffText = try await fullPullRequestDiff(
+                number: number,
+                repository: repository,
+                metadata: metadata
             )
-            guard diff.succeeded else {
-                throw ReviewEngineError.commandFailed("Could not download the PR diff: \(conciseError(diff))")
-            }
-            diffText = diff.stdout
         }
-        try Data(diffText.utf8).write(
+        // Cut the patch down to something a reviewer can finish reading, and keep the result —
+        // what is written here is exactly what a reviewer can be influenced by, so it is also
+        // what `InjectionGuard` scans and what the posted review describes.
+        let fitted = DiffBudget.fit(diffText)
+        try Data(fitted.patch.utf8).write(
             to: worktree.appendingPathComponent(".review-bot-diff.patch"),
             options: .atomic
         )
+        if fitted.isTruncated {
+            await logger.append(
+                "PR \(repository.githubSlug)#\(number): the diff was too large to include in full — "
+                    + "reviewers got complete hunks for \(fitted.completeFiles) of \(fitted.totalFiles) changed files."
+            )
+        }
 
         // When we narrowed the diff to the new commits, tell the reviewers so they focus on the
         // delta and don't re-flag already-reviewed code. Prepended to the thread they already read.
@@ -1049,7 +1142,7 @@ actor ReviewEngine {
             to: worktree.appendingPathComponent(".review-bot-thread.md"),
             options: .atomic
         )
-        return ReviewContext(thread: thread, diff: diffText)
+        return ReviewContext(thread: thread, diff: fitted.patch, diffTruncation: fitted)
     }
 
     /// Removes a Review Bot context file that the pull request itself committed at the same path.
@@ -1098,23 +1191,11 @@ actor ReviewEngine {
                 .filter { !$0.isEmpty }
         }
 
-        // `baseRefOid` is a snapshot GitHub took of the base ref, not its live tip. Once an author
-        // merges the base branch in, that snapshot becomes an ancestor of the head, `behind`
-        // collapses to 0, and the preview silently disappears — precisely in the case it exists
-        // for, since a branch that has been synced once is the one most likely to drift again.
-        // `prepareReviewContext` fetches the base into `refs/remotes/origin/<name>` immediately
-        // before this, so prefer that ref and fall back to the snapshot only when it will not
-        // resolve (an unusual remote layout, or a base branch deleted since the fetch).
+        // Resolved against the live remote-tracking ref rather than GitHub's `baseRefOid`
+        // snapshot — see `resolvedBaseCommit` for why that distinction is what keeps this
+        // preview from vanishing on exactly the branches that need it.
         let head = metadata.headRefOid
-        let trackedBase = await git([
-            "rev-parse", "--verify", "--quiet",
-            "refs/remotes/origin/\(metadata.baseRefName)^{commit}",
-        ])
-        let base = trackedBase.flatMap { result -> String? in
-            guard result.succeeded else { return nil }
-            let oid = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            return oid.isEmpty ? nil : oid
-        } ?? metadata.baseRefOid
+        let base = await resolvedBaseCommit(repository: repository, metadata: metadata)
 
         guard let mergeBaseResult = await git(["merge-base", base, head]),
               mergeBaseResult.succeeded,
@@ -1194,7 +1275,9 @@ actor ReviewEngine {
 
         let diff = try? await runner.run(
             "git",
-            arguments: ["-C", repository.path, "diff", priorHead, currentHead],
+            // `--no-color` because a developer with `color.diff = always` in their gitconfig
+            // would otherwise get ANSI escapes written into the patch file the reviewers read.
+            arguments: ["-C", repository.path, "diff", "--no-color", priorHead, currentHead],
             timeout: 120
         )
         guard let diff, diff.succeeded else { return nil }
@@ -1592,10 +1675,8 @@ actor ReviewEngine {
     /// review to guard against a CLI nobody has reported. Cost comes straight from the CLI, so
     /// there is no price table to keep current.
     private func claudeOutput(_ stdout: String) -> CLIReviewOutput {
-        guard let envelope = try? JSONDecoder().decode(
-            ClaudeResultEnvelope.self,
-            from: Data(stdout.utf8)
-        ), let result = envelope.result else {
+        guard let envelope = Self.claudeResultEnvelope(in: Data(stdout.utf8)),
+              let result = envelope.result else {
             return CLIReviewOutput(text: stdout, usage: nil, failure: nil, parsedEnvelope: false)
         }
 
@@ -1617,6 +1698,43 @@ actor ReviewEngine {
                 : nil,
             parsedEnvelope: true
         )
+    }
+
+    /// The result envelope from a `--output-format json` run, however the CLI chose to wrap it.
+    ///
+    /// It used to answer with the envelope alone. Claude Code 2.1.280 answers with the whole
+    /// event stream as a JSON array — `system`, `assistant`, `rate_limit_event`, … and finally
+    /// the `result` element — which does not decode as a single object, so the review fell back
+    /// to being read as raw stdout: sixteen kilobytes of JSON with no trailing `VERDICT:` line
+    /// in it. The reviewer was then recorded as having produced no verdict and dropped from the
+    /// panel, twice per review (the in-review retry re-ran and re-paid for the same result),
+    /// leaving a partial panel that may not approve. Every review came back as a neutral
+    /// comment while the verdict sat correctly parsed inside the discarded JSON.
+    ///
+    /// Both shapes are accepted, since which one arrives depends on the CLI the developer
+    /// happens to have installed. The element is isolated with `JSONSerialization` and decoded
+    /// on its own rather than the array being decoded as `[ClaudeResultEnvelope]`: the sibling
+    /// events have entirely different shapes, and one of them failing to decode would take the
+    /// result down with it.
+    private static func claudeResultEnvelope(in data: Data) -> ClaudeResultEnvelope? {
+        if let single = try? JSONDecoder().decode(ClaudeResultEnvelope.self, from: data),
+           single.result != nil {
+            return single
+        }
+        guard let events = (try? JSONSerialization.jsonObject(with: data)) as? [Any] else {
+            return nil
+        }
+        // Last rather than first: a run that emits several `result` elements has the final one
+        // as its answer.
+        for event in events.reversed() {
+            guard let object = event as? [String: Any],
+                  object["type"] as? String == "result",
+                  let elementData = try? JSONSerialization.data(withJSONObject: object),
+                  let envelope = try? JSONDecoder().decode(ClaudeResultEnvelope.self, from: elementData)
+            else { continue }
+            return envelope
+        }
+        return nil
     }
 
     private struct ClaudeResultEnvelope: Decodable {
@@ -2030,6 +2148,7 @@ actor ReviewEngine {
         adjudication: ReviewerResult?,
         guardReason: InjectionGuard.Reason?,
         approvalWithheldForPartialPanel: Bool,
+        diffTruncation: DiffBudget.Outcome,
         usageReport: String?
     ) -> String {
         let verdictSummary = results.map {
@@ -2088,6 +2207,23 @@ actor ReviewEngine {
             """
         }
 
+        // Same reasoning as the partial panel above, applied to the other half of the evidence:
+        // a reviewer that could not see the whole diff may simply not have been shown the
+        // defect. Say which files were missing from the patch so an author reading an approval
+        // knows how much of their change it actually covers.
+        var diffTruncationDisclosure = ""
+        if diffTruncation.isTruncated {
+            let omitted = diffTruncation.omittedFiles
+            let scope = omitted > 0
+                ? "the remaining \(omitted) had their changed lines left out of the patch"
+                : "the rest of that file's changes were cut from the patch"
+            diffTruncationDisclosure = """
+
+
+            > **The diff was too large to review in full: the panel saw complete hunks for \(diffTruncation.completeFiles) of \(diffTruncation.totalFiles) changed files.** Every changed file was named in the patch and checked out for reading, but \(scope) — so treat this as partial coverage of the change rather than a review of all of it.
+            """
+        }
+
         var guardDisclosure = ""
         if let guardReason {
             guardDisclosure = """
@@ -2118,7 +2254,7 @@ actor ReviewEngine {
         return """
         ## Automated review — PR #\(pullRequest.number)
 
-        **Decision: \(decision.title)** — \(note)\(partialPanelDisclosure)\(reconciliationSection)\(guardDisclosure)
+        **Decision: \(decision.title)** — \(note)\(partialPanelDisclosure)\(diffTruncationDisclosure)\(reconciliationSection)\(guardDisclosure)
 
         Independent reviews of `\(commitSHA.prefix(8))` (\(verdictSummary)). These findings are advisory; verify them before acting.
 

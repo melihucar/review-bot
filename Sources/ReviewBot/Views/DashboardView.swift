@@ -791,7 +791,7 @@ private struct HistoryView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(history.entries) { entry in
-                    HistoryRow(entry: entry)
+                    HistoryRow(entry: entry, onReport: entry.kind == .failed ? { model.reportFailure(entry) } : nil)
                 }
                 .listStyle(.inset)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -813,6 +813,9 @@ private struct HistoryView: View {
 
 private struct HistoryRow: View {
     let entry: HistoryEntry
+    /// Non-nil only for a failed entry — the row that has something to report. `nil` renders
+    /// every non-failed row exactly as before.
+    let onReport: (() -> Void)?
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -860,6 +863,11 @@ private struct HistoryRow: View {
                 if let value = entry.pullRequestURL, let url = URL(string: value) {
                     Link("Open PR", destination: url)
                         .font(.caption)
+                }
+                if let onReport {
+                    Button("Report issue", action: onReport)
+                        .font(.caption)
+                        .buttonStyle(.link)
                 }
             }
         }

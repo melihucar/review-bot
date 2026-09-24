@@ -224,6 +224,67 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([paths.root])
     }
 
+    /// Builds a diagnostic from a failed history entry, copies the full report to the
+    /// pasteboard, and opens GitHub's prefilled new-issue form. Review Bot never files the
+    /// issue itself — a failure report necessarily names the repository and pull request it
+    /// came from, and those are often private, so the prefilled form (which the person still
+    /// has to press "Submit" on) is the review step.
+    func reportFailure(_ entry: HistoryEntry) {
+        let configuration = settings.configuration
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+        let environment = IssueReport.Environment(
+            // `CFBundleShortVersionString` is only stamped by `scripts/build-app.sh`, so it is
+            // absent under `swift run` — say so honestly instead of shipping an empty field.
+            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+                ?? "unknown (development build)",
+            operatingSystem: "\(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)",
+            toolAvailability: toolAvailability,
+            enabledReviewers: enabledReviewerDescriptions(configuration),
+            pollIntervalMinutes: configuration.pollIntervalMinutes,
+            maxConcurrentReviews: configuration.maxConcurrentReviews,
+            failureBudget: failureBudgetDescription(configuration.failureBudget),
+            reviewScope: configuration.reviewScope.label,
+            dataFolderPath: paths.root.path
+        )
+        let report = IssueReport(entry: entry, environment: environment, generatedAt: Date())
+
+        guard let url = report.formURL() else {
+            errorMessage = "Could not build a GitHub issue link for this failure."
+            return
+        }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(report.body, forType: .string)
+        NSWorkspace.shared.open(url)
+        status = "Opened a prefilled GitHub issue for this failure — the full report is also on your clipboard."
+    }
+
+    /// Each enabled reviewer with its configured model, e.g. "Claude (claude-opus-5)" — named
+    /// alongside the model, since a wrong or retired model id is a common cause of the very
+    /// failure being reported.
+    private func enabledReviewerDescriptions(_ configuration: ReviewBotConfiguration) -> [String] {
+        var reviewers: [String] = []
+        if configuration.claude.enabled {
+            reviewers.append("Claude (\(configuration.claude.model))")
+        }
+        if configuration.codex.enabled {
+            reviewers.append("Codex (\(configuration.codex.model))")
+        }
+        if configuration.opencode.enabled {
+            reviewers.append("opencode (\(configuration.opencode.model))")
+        }
+        if configuration.gemini.enabled {
+            reviewers.append("Gemini (\(configuration.gemini.model))")
+        }
+        return reviewers
+    }
+
+    private func failureBudgetDescription(_ budget: FailureBudget) -> String {
+        guard let limit = budget.limit else { return "unlimited" }
+        return "\(limit) attempt\(limit == 1 ? "" : "s")"
+    }
+
     func openSettings() {
         let controller: NSWindowController
         if let settingsWindowController {
