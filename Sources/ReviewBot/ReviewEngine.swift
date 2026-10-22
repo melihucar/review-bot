@@ -32,6 +32,11 @@ actor ReviewEngine {
     private let now: @Sendable () -> Date
     /// Serializes the git steps of concurrent reviews that share a clone.
     private let gitGate = RepositoryGate()
+    /// Until when every `gh search` waits, after GitHub answered one with a rate limit
+    /// (see `PullRequestSearch`).
+    private var searchesHeldUntil: Date?
+    /// Rate limits in a row, which sets the next hold; a search that succeeds resets it.
+    private var consecutiveSearchLimits = 0
 
     private struct PendingPullRequest: Sendable {
         let summary: PullRequestSummary
@@ -101,14 +106,21 @@ actor ReviewEngine {
 
             var pendingReviews: [PendingPullRequest] = []
             var deferredRequests = 0
+            let requests = await openReviewRequests(
+                repositories: repositories,
+                onEvent: onEvent,
+                onStatus: onStatus
+            )
             for repository in repositories {
+                // No entry: its owner's search failed or is held, which is not "no requests".
+                guard let pullRequests = requests[repository.githubSlug.lowercased()] else { continue }
                 let discovered = await discoverPendingReviews(
                     repository: repository,
+                    pullRequests: pullRequests,
                     githubUser: githubUser,
                     configuration: configuration,
                     manual: manual,
-                    onEvent: onEvent,
-                    onStatus: onStatus
+                    onEvent: onEvent
                 )
                 pendingReviews.append(contentsOf: discovered.pending)
                 deferredRequests += discovered.deferred
@@ -122,7 +134,9 @@ actor ReviewEngine {
             )
 
             await onStatus(
-                watchingStatus(
+                searchHoldRemaining().map {
+                    "GitHub search rate limit — checking again in about \(RetryPolicy.durationDescription($0))"
+                } ?? watchingStatus(
                     repositoryCount: repositories.count,
                     deferredRequests: deferredRequests
                 )
@@ -144,172 +158,213 @@ actor ReviewEngine {
         }
     }
 
+    /// The open review requests of every watched repository, keyed by its lower-cased slug,
+    /// from one `gh search` per owner (see `PullRequestSearch`). A repository whose owner's
+    /// search failed, or was held by a rate limit, has no entry.
+    private func openReviewRequests(
+        repositories: [RepositoryConfiguration],
+        onEvent: @escaping EventSink,
+        onStatus: @escaping StatusSink
+    ) async -> [String: [PullRequestSummary]] {
+        var requests: [String: [PullRequestSummary]] = [:]
+        for owner in PullRequestSearch.owners(of: repositories) {
+            if let remaining = searchHoldRemaining() {
+                await logger.append(
+                    "Skipping the search for \(owner): GitHub rate-limited searches; retrying in \(RetryPolicy.durationDescription(remaining))."
+                )
+                continue
+            }
+            let covered = repositories.filter {
+                PullRequestSearch.owner(of: $0.githubSlug).lowercased() == owner.lowercased()
+            }
+            // One repository keeps its own name in the history; several share the owner's.
+            let subject = covered.count == 1 ? covered[0].githubSlug : "\(owner) (\(covered.count) repositories)"
+            do {
+                await onStatus("Checking \(covered.count == 1 ? covered[0].name : owner)…")
+                let result = try await runner.run(
+                    "gh",
+                    arguments: PullRequestSearch.openRequestArguments(owner: owner),
+                    timeout: 60
+                )
+                guard result.succeeded else {
+                    var message = "Could not list pull requests for \(subject): \(conciseError(result))"
+                    if PullRequestSearch.isRateLimited(result) {
+                        message += " Searches pause for \(RetryPolicy.durationDescription(holdSearches()))."
+                    }
+                    throw ReviewEngineError.commandFailed(message)
+                }
+
+                let pullRequests: [PullRequestSummary]
+                do {
+                    pullRequests = try JSONDecoder().decode(
+                        [PullRequestSummary].self,
+                        from: Data(result.stdout.utf8)
+                    )
+                } catch {
+                    throw ReviewEngineError.invalidResponse(
+                        "GitHub returned an unexpected response for \(subject)."
+                    )
+                }
+                consecutiveSearchLimits = 0
+
+                let grouped = PullRequestSearch.byRepository(pullRequests, watching: covered)
+                for repository in covered {
+                    let slug = repository.githubSlug.lowercased()
+                    requests[slug] = grouped[slug] ?? []
+                }
+            } catch {
+                await logger.append("Repository \(subject) failed: \(error.localizedDescription)")
+                await onEvent(
+                    HistoryEntry(
+                        kind: .failed,
+                        repositoryName: covered.count == 1 ? covered[0].name : owner,
+                        repositorySlug: covered.count == 1 ? covered[0].githubSlug : "",
+                        pullRequestNumber: nil,
+                        pullRequestTitle: nil,
+                        pullRequestURL: nil,
+                        message: error.localizedDescription
+                    )
+                )
+            }
+        }
+        return requests
+    }
+
+    /// How long searches still wait after a rate limit, or `nil` when they may run.
+    private func searchHoldRemaining() -> TimeInterval? {
+        guard let searchesHeldUntil else { return nil }
+        let remaining = searchesHeldUntil.timeIntervalSince(now())
+        return remaining > 0 ? remaining : nil
+    }
+
+    /// Holds every search after GitHub rate-limited one; returns how long for.
+    private func holdSearches() -> TimeInterval {
+        consecutiveSearchLimits += 1
+        let hold = PullRequestSearch.hold(afterConsecutiveLimits: consecutiveSearchLimits)
+        searchesHeldUntil = now().addingTimeInterval(hold)
+        return hold
+    }
+
     private func discoverPendingReviews(
         repository: RepositoryConfiguration,
+        pullRequests: [PullRequestSummary],
         githubUser: String,
         configuration: ReviewBotConfiguration,
         manual: Bool,
-        onEvent: @escaping EventSink,
-        onStatus: @escaping StatusSink
+        onEvent: @escaping EventSink
     ) async -> (pending: [PendingPullRequest], deferred: Int) {
         let maxRounds = configuration.maxReviewRoundsPerPR
         var deferred = 0
-        do {
-            await onStatus("Checking \(repository.name)…")
-            let result = try await runner.run(
-                "gh",
-                arguments: [
-                    "search", "prs",
-                    "--repo", repository.githubSlug,
-                    "--review-requested=@me",
-                    "--state", "open",
-                    "--json", "number,title,url",
-                ],
-                timeout: 60
+        var pending: [PendingPullRequest] = []
+        for pullRequest in pullRequests {
+            // Inspecting a pull request can fail on its own (metadata or timeline),
+            // which is now reported rather than silently degraded — so it needs the
+            // same bound as a failing review, or a renamed repo or a lost token
+            // would post one failure per poll forever.
+            let inspectionKey = "\(repository.githubSlug)#\(pullRequest.number)@discovery"
+            let inspection = manual ? RetryDecision.run : RetryPolicy.decide(
+                attempt: attempts.attempt(for: inspectionKey),
+                budget: configuration.failureBudget,
+                pollIntervalMinutes: configuration.pollIntervalMinutes,
+                now: now()
             )
-            guard result.succeeded else {
-                throw ReviewEngineError.commandFailed(
-                    "Could not list pull requests for \(repository.githubSlug): \(conciseError(result))"
-                )
+            if let deferral = deferralLog(
+                inspection,
+                repository: repository,
+                number: pullRequest.number,
+                subject: "inspection of"
+            ) {
+                await logger.append(deferral)
+                deferred += 1
+                continue
             }
 
-            let pullRequests: [PullRequestSummary]
             do {
-                pullRequests = try JSONDecoder().decode(
-                    [PullRequestSummary].self,
-                    from: Data(result.stdout.utf8)
+                let metadata = try await pullRequestMetadata(
+                    number: pullRequest.number,
+                    repository: repository
                 )
-            } catch {
-                throw ReviewEngineError.invalidResponse(
-                    "GitHub returned an unexpected response for \(repository.githubSlug)."
+                let requestMarker = try await latestReviewRequestMarker(
+                    number: pullRequest.number,
+                    repository: repository,
+                    githubUser: githubUser,
+                    fallback: metadata.headRefOid
                 )
-            }
+                attempts.clear(inspectionKey, at: now())
 
-            var pending: [PendingPullRequest] = []
-            for pullRequest in pullRequests {
-                // Inspecting a pull request can fail on its own (metadata or timeline),
-                // which is now reported rather than silently degraded — so it needs the
-                // same bound as a failing review, or a renamed repo or a lost token
-                // would post one failure per poll forever.
-                let inspectionKey = "\(repository.githubSlug)#\(pullRequest.number)@discovery"
-                let inspection = manual ? RetryDecision.run : RetryPolicy.decide(
-                    attempt: attempts.attempt(for: inspectionKey),
+                let reviewKey = "\(repository.githubSlug)#\(pullRequest.number)@\(metadata.headRefOid)@\(requestMarker)"
+                guard !reviewedState.contains(reviewKey) else { continue }
+
+                // A request that keeps failing is retried on a widening schedule and
+                // eventually abandoned, so a broken reviewer can't re-run the whole
+                // pipeline on every poll forever. A manual run ignores both.
+                let retry = manual ? RetryDecision.run : RetryPolicy.decide(
+                    attempt: attempts.attempt(for: reviewKey),
                     budget: configuration.failureBudget,
                     pollIntervalMinutes: configuration.pollIntervalMinutes,
                     now: now()
                 )
                 if let deferral = deferralLog(
-                    inspection,
+                    retry,
                     repository: repository,
-                    number: pullRequest.number,
-                    subject: "inspection of"
+                    number: pullRequest.number
                 ) {
                     await logger.append(deferral)
                     deferred += 1
                     continue
                 }
 
-                do {
-                    let metadata = try await pullRequestMetadata(
-                        number: pullRequest.number,
-                        repository: repository
-                    )
-                    let requestMarker = try await latestReviewRequestMarker(
-                        number: pullRequest.number,
-                        repository: repository,
-                        githubUser: githubUser,
-                        fallback: metadata.headRefOid
-                    )
-                    attempts.clear(inspectionKey, at: now())
-
-                    let reviewKey = "\(repository.githubSlug)#\(pullRequest.number)@\(metadata.headRefOid)@\(requestMarker)"
-                    guard !reviewedState.contains(reviewKey) else { continue }
-
-                    // A request that keeps failing is retried on a widening schedule and
-                    // eventually abandoned, so a broken reviewer can't re-run the whole
-                    // pipeline on every poll forever. A manual run ignores both.
-                    let retry = manual ? RetryDecision.run : RetryPolicy.decide(
-                        attempt: attempts.attempt(for: reviewKey),
-                        budget: configuration.failureBudget,
-                        pollIntervalMinutes: configuration.pollIntervalMinutes,
-                        now: now()
-                    )
-                    if let deferral = deferralLog(
-                        retry,
-                        repository: repository,
-                        number: pullRequest.number
-                    ) {
-                        await logger.append(deferral)
-                        deferred += 1
+                // Stop re-reviewing a PR once it has hit its configured round cap.
+                if let maxRounds {
+                    let prPrefix = "\(repository.githubSlug)#\(pullRequest.number)@"
+                    if reviewedState.count(withPrefix: prPrefix) >= maxRounds {
+                        await logger.append(
+                            "Skipping \(repository.githubSlug)#\(pullRequest.number): reached the \(maxRounds)-review limit."
+                        )
                         continue
                     }
-
-                    // Stop re-reviewing a PR once it has hit its configured round cap.
-                    if let maxRounds {
-                        let prPrefix = "\(repository.githubSlug)#\(pullRequest.number)@"
-                        if reviewedState.count(withPrefix: prPrefix) >= maxRounds {
-                            await logger.append(
-                                "Skipping \(repository.githubSlug)#\(pullRequest.number): reached the \(maxRounds)-review limit."
-                            )
-                            continue
-                        }
-                    }
-
-                    await emit(
-                        kind: .requestDetected,
-                        repository: repository,
-                        pullRequest: pullRequest,
-                        message: "Review requested at \(shortMarker(requestMarker)).",
-                        onEvent: onEvent
-                    )
-                    pending.append(
-                        PendingPullRequest(
-                            summary: pullRequest,
-                            metadata: metadata,
-                            repository: repository,
-                            requestMarker: requestMarker,
-                            reviewKey: reviewKey
-                        )
-                    )
-                } catch {
-                    let failures = attempts.recordFailure(for: inspectionKey, at: now())
-                    let message = error.localizedDescription + " " + RetryPolicy.note(
-                        failures: failures,
-                        budget: configuration.failureBudget,
-                        pollIntervalMinutes: configuration.pollIntervalMinutes
-                    )
-                    await logger.append(
-                        "Could not inspect \(repository.githubSlug)#\(pullRequest.number): \(message)"
-                    )
-                    await onEvent(
-                        HistoryEntry(
-                            kind: .failed,
-                            repositoryName: repository.name,
-                            repositorySlug: repository.githubSlug,
-                            pullRequestNumber: pullRequest.number,
-                            pullRequestTitle: pullRequest.title,
-                            pullRequestURL: pullRequest.url,
-                            message: message
-                        )
-                    )
                 }
-            }
-            return (pending, deferred)
-        } catch {
-            await logger.append("Repository \(repository.githubSlug) failed: \(error.localizedDescription)")
-            await onEvent(
-                HistoryEntry(
-                    kind: .failed,
-                    repositoryName: repository.name,
-                    repositorySlug: repository.githubSlug,
-                    pullRequestNumber: nil,
-                    pullRequestTitle: nil,
-                    pullRequestURL: nil,
-                    message: error.localizedDescription
+
+                await emit(
+                    kind: .requestDetected,
+                    repository: repository,
+                    pullRequest: pullRequest,
+                    message: "Review requested at \(shortMarker(requestMarker)).",
+                    onEvent: onEvent
                 )
-            )
-            return ([], deferred)
+                pending.append(
+                    PendingPullRequest(
+                        summary: pullRequest,
+                        metadata: metadata,
+                        repository: repository,
+                        requestMarker: requestMarker,
+                        reviewKey: reviewKey
+                    )
+                )
+            } catch {
+                let failures = attempts.recordFailure(for: inspectionKey, at: now())
+                let message = error.localizedDescription + " " + RetryPolicy.note(
+                    failures: failures,
+                    budget: configuration.failureBudget,
+                    pollIntervalMinutes: configuration.pollIntervalMinutes
+                )
+                await logger.append(
+                    "Could not inspect \(repository.githubSlug)#\(pullRequest.number): \(message)"
+                )
+                await onEvent(
+                    HistoryEntry(
+                        kind: .failed,
+                        repositoryName: repository.name,
+                        repositorySlug: repository.githubSlug,
+                        pullRequestNumber: pullRequest.number,
+                        pullRequestTitle: pullRequest.title,
+                        pullRequestURL: pullRequest.url,
+                        message: message
+                    )
+                )
+            }
         }
+        return (pending, deferred)
     }
 
     /// The log line for work discovery is skipping, or `nil` when it may run.

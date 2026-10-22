@@ -45,6 +45,80 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(sawPreparedDiff)
     }
 
+    /// GitHub's search API allows 30 requests a minute and answers a burst with a secondary
+    /// rate limit. Ten repositories used to cost ten searches a poll; repositories of one
+    /// owner now share one.
+    func testAPollSearchesOncePerOwner() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.repositories += [
+            RepositoryConfiguration(name: "gadget", path: "/mock/gadget", githubSlug: "acme/gadget"),
+            RepositoryConfiguration(name: "sprocket", path: "/mock/sprocket", githubSlug: "ACME/sprocket"),
+        ]
+
+        await engine.poll(configuration: configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+
+        let searches = await runner.searches()
+        XCTAssertEqual(searches.count, 1, "one search for the one owner, however it is spelled: \(searches)")
+        XCTAssertEqual(searches.first.flatMap { $0.firstIndex(of: "--owner") }.map { searches[0][$0 + 1] }, "acme")
+        XCTAssertFalse(searches.contains { $0.contains("--repo") })
+
+        let events = await recorder.snapshot()
+        // #42 is acme/widget's; #7 belongs to a repository nobody watches.
+        XCTAssertEqual(events.compactMap(\.pullRequestNumber), [42, 42, 42])
+        XCTAssertEqual(events.map(\.kind), [.requestDetected, .reviewStarted, .approved])
+    }
+
+    func testARateLimitedSearchHoldsEverySearchUntilTheHoldPasses() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        let recorder = EventRecorder()
+        let status = StatusRecorder()
+
+        await runner.setSearchRateLimited(true)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { await status.append($0) })
+        let failed = await recorder.snapshot()
+        XCTAssertEqual(failed.map(\.kind), [.failed])
+        XCTAssertTrue(failed.first?.message.contains("secondary rate limit") == true, failed.first?.message ?? "")
+        XCTAssertTrue(failed.first?.message.contains("Searches pause for 5 minutes") == true, failed.first?.message ?? "")
+        let lastStatus = await status.snapshot().last
+        XCTAssertTrue(lastStatus?.contains("rate limit") == true, lastStatus ?? "")
+
+        // Inside the hold nothing searches, even though GitHub would answer by now.
+        await runner.setSearchRateLimited(false)
+        clock.advance(minutes: 3)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        let insideHold = await runner.searches().count
+        XCTAssertEqual(insideHold, 1)
+
+        clock.advance(minutes: 3)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        let events = await recorder.snapshot()
+        XCTAssertEqual(events.map(\.kind), [.failed, .requestDetected, .reviewStarted, .approved])
+    }
+
+    func testRateLimitsInARowHoldSearchesLonger() async throws {
+        let fixture = try FeatureFixture()
+        let clock = TestClock()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner, now: clock.read)
+        let recorder = EventRecorder()
+
+        await runner.setSearchRateLimited(true)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+        clock.advance(minutes: 6)
+        await engine.poll(configuration: fixture.configuration, onEvent: { await recorder.append($0) }, onStatus: { _ in })
+
+        let messages = await recorder.snapshot().map(\.message)
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertTrue(messages.last?.contains("Searches pause for 10 minutes") == true, messages.last ?? "")
+    }
+
     func testAlreadyReviewedRequestIsNotRunOrPostedAgain() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock()
@@ -2594,6 +2668,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// `gh pr diff` refuses the pull request. `nil` until that fallback actually runs.
     private var threeDotDiffArgs: [String]?
     private var commandLog: [[String]] = []
+    /// When set, every `gh search prs` fails the way GitHub answers a burst of searches.
+    private var searchRateLimited = false
     /// Flips true once any ordinary reviewer (claude in its non-reconciliation role, codex,
     /// or opencode) has been invoked — used to make the `gh pr view --json` head answer
     /// change partway through a review, the way a real push would.
@@ -2858,7 +2934,17 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: "reviewer\n")
         }
         if executable == "gh", arguments.starts(with: ["search", "prs"]) {
-            return result(stdout: #"[{"number":42,"title":"Improve widgets","url":"https://github.com/acme/widget/pull/42"}]"#)
+            if searchRateLimited {
+                return result(
+                    exitCode: 1,
+                    stderr: "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again."
+                )
+            }
+            // The search is owner-wide, so it also finds requests in repositories nobody
+            // watches; #7 must never be inspected (it has no `pr view` answer here).
+            return result(
+                stdout: #"[{"number":42,"title":"Improve widgets","url":"https://github.com/acme/widget/pull/42","repository":{"name":"widget","nameWithOwner":"acme/widget"}},{"number":7,"title":"Elsewhere","url":"https://github.com/acme/elsewhere/pull/7","repository":{"name":"elsewhere","nameWithOwner":"acme/elsewhere"}}]"#
+            )
         }
         if executable == "gh", arguments.starts(with: ["pr", "view", "42"]),
            arguments.contains("--json") {
@@ -3240,6 +3326,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func lastPostedCommitId() -> String? { postedCommitIds.last }
     func lastBodyFlag() -> String? { bodyFlag }
     func commands() -> [[String]] { commandLog }
+    func searches() -> [[String]] { commandLog.filter { $0.starts(with: ["gh", "search", "prs"]) } }
+    func setSearchRateLimited(_ limited: Bool) { searchRateLimited = limited }
     func lastClaudePrompt() -> String { claudePrompt }
     func sawPreparedDiffDuringReview() -> Bool { preparedDiffSeen }
     func mergePreviewDuringReview() -> String? { mergePreviewText }

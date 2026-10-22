@@ -739,6 +739,13 @@ struct PullRequestSummary: Decodable {
     let number: Int
     let title: String
     let url: String
+    /// The repository a search result belongs to; absent from older answers, where
+    /// `PullRequestSearch.slug(of:)` falls back to the URL.
+    var repository: Repository? = nil
+
+    struct Repository: Decodable {
+        let nameWithOwner: String
+    }
 }
 
 struct PullRequestMetadata: Decodable {

@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Fixed
+
+- **Polling no longer trips GitHub's secondary rate limit.** Every poll ran one `gh search prs` per repository back to back — ten searches within seconds for ten repositories — and GitHub's search API (30 requests a minute per account, shared with anything else searching as you) answered that burst with "You have exceeded a secondary rate limit", which showed up as a failed check of a repository. A poll now runs one search per repository *owner* and keeps the results for the repositories you watch, so ten repositories of one organisation cost one search. And when GitHub does answer a search with a rate limit, every search waits — 5 minutes, then 10, 20, 40, up to an hour for limits in a row — instead of trying again on the next poll; the failure is reported once and the status line says when searching resumes.
+
 ## [0.4.0] - 2026-09-24
 
 ### Added

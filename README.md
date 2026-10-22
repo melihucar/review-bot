@@ -155,7 +155,7 @@ Generated reviews clearly identify each reviewer and preserve their findings in 
 
 ## Runtime flow
 
-1. Poll each enabled repository for open PRs with `review-requested:@me`.
+1. Search once per owner of the enabled repositories for open PRs with `review-requested:@me`, keeping the ones in watched repositories; a rate-limited search holds every search for a few minutes.
 2. Read the head commit and latest matching `review_requested` event.
 3. Skip the request if that exact commit and request event was completed previously.
 4. Fetch the PR ref, the base branch, and — for a same-repository PR — its head branch, then create a detached worktree under Review Bot's private data directory; abort instead of reviewing a stale commit if the head branch moved since step 2. The reviewers' prompt states these branch facts (base, head, reviewed commit, and the head branch's freshly fetched tip) explicitly, since the worktree's other refs can be arbitrarily stale.
