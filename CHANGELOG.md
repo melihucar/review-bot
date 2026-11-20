@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Added
+
+- **Give one repository its own decision policy and review instructions.** Every repository in Dashboard → Repositories now has a **Customize…** button. It opens a sheet where that repository can use a different decision policy — what Review Bot does on GitHub for `SHOULD_FIX`, `NITS_ONLY` and `CLEAN` — and carry review instructions of its own. Those instructions are either added after the global ones, which is the default, or sent instead of them; they always come before the repository's `REVIEW.md`, which keeps the last word. Leaving the instructions empty keeps the global ones, so a blank field never removes them. A repository you have not customized behaves exactly as before and follows the global settings, including later changes to them, and a customized one says so on its row. **Reset to global** clears both. The safeguards do not move with the policy: `BLOCKING` always requests changes, a partial panel never approves, and the injection check still runs. When a repository's own policy decided a review, the posted review and the activity history say so.
+
 ## [0.5.0] - 2026-11-20
 
 ### Added

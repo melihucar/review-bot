@@ -16,6 +16,7 @@ GitHub access always goes through your authenticated `gh` CLI — the app never 
 - Track tokens and cost per review for the reviewers billed per token, and optionally publish that in the review.
 - Append a small developer-specific instruction prompt to every review.
 - Enforce repository-specific rules from `REVIEW.md`.
+- Give any repository its own decision policy and review instructions, on top of or instead of the global ones.
 - Run enabled reviewers independently in a read-only worktree.
 - Post the strictest reviewer decision through the GitHub CLI, pinned to the commit that was reviewed.
 - Keep activity history, detailed logs, and generated review Markdown locally.
@@ -71,13 +72,11 @@ Launch-at-login registration only works reliably from the packaged app in `/Appl
 2. Paste a repository's GitHub address, or choose a folder you already cloned.
 3. Confirm the `owner/repository` GitHub slug.
 4. Enable Claude, Codex, opencode, or Gemini and set their model and effort values. opencode and Gemini are off by default.
-5. Choose a polling interval.
-6. Optionally add global custom review instructions.
-7. Select **Run now** to verify the setup.
 5. For each reviewer, choose **Signed-in CLI** or **API key**; in key mode, paste the key and select **Save**. opencode uses its own configuration and has no key field.
 6. Choose a polling interval.
 7. Optionally add global custom review instructions.
-8. Select **Run now** to verify the setup.
+8. Optionally select **Customize…** on a repository to give it its own decision policy or review instructions.
+9. Select **Run now** to verify the setup.
 
 CLI availability is shown on the Reviewers tab. Review Bot asks your login shell for its `PATH` at startup — so CLIs installed through a version manager (nvm, mise, volta, fnm, asdf) are found even when the app is launched from Finder or at login — and also searches common Homebrew, local-user, and npm binary directories in addition to the process `PATH`.
 
@@ -126,6 +125,17 @@ Example:
 - Public API removals require an explicit migration note.
 ```
 
+## Per-repository settings
+
+Every repository in Settings → Repositories has a **Customize…** button. It opens a sheet with two independent overrides; anything you leave alone follows the global setting, including later changes to it.
+
+- **Decision policy.** Switch on "Use a different decision policy for this repository" to choose what Review Bot does on GitHub for `SHOULD_FIX`, `NITS_ONLY`, and `CLEAN` in this repository only. With the switch off, the repository follows the global policy.
+- **Review instructions.** Text that is either added to the global custom instructions (the default) or sent instead of them. An empty field always means "inherit": a blank prompt never removes the global one.
+
+Layering, in prompt order: Review Bot's built-in contract, the pull request facts, the global instructions, the repository's own instructions, then the repository's `REVIEW.md`. `REVIEW.md` stays last. These overrides live in `config.json` on your Mac, typed by you; `REVIEW.md` is the team's file, read from the pull request's base commit, and still applies last.
+
+A customized repository shows a **Custom** line on its row, and **Reset to global** in the sheet clears both overrides. The safeguards do not move with the policy: `BLOCKING` always requests changes, a partial panel never approves, and the injection check still runs. When a repository's own policy decided a review, the posted review and the activity history say so.
+
 ## Review decisions
 
 Every enabled reviewer must end with one verdict:
@@ -135,7 +145,7 @@ Every enabled reviewer must end with one verdict:
 - `NITS_ONLY`
 - `CLEAN`
 
-Each verdict maps to a GitHub action under the configured decision policy (`BLOCKING` is always Request changes; `SHOULD_FIX`, `NITS_ONLY`, and `CLEAN` are each configurable on the dashboard). Review Bot takes the strictest configured action among the reviewers that returned a verdict:
+Each verdict maps to a GitHub action under the configured decision policy — the repository's own if you customized it, otherwise the global one (`BLOCKING` is always Request changes; `SHOULD_FIX`, `NITS_ONLY`, and `CLEAN` are each configurable on the dashboard). Review Bot takes the strictest configured action among the reviewers that returned a verdict:
 
 | Results | GitHub action |
 | --- | --- |
@@ -188,7 +198,7 @@ Review Bot writes to:
 └── worktrees/
 ```
 
-- `config.json` contains app settings and repository paths. It records which credential source each reviewer uses, never the key itself.
+- `config.json` contains app settings, repository paths, and any per-repository overrides. It records which credential source each reviewer uses, never the key itself.
 - `history.json` backs the activity-history interface and is capped at 2,000 entries.
 - `reviewed.json` contains deduplication keys.
 - `logs/` contains daily operational logs.
@@ -215,7 +225,7 @@ Use **History → Show data folder** to open this location.
 make test
 ```
 
-The suite contains unit tests for remote parsing, repository address parsing, the access check, managed clones, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, repository inspection, credential resolution, environment composition, and token-usage arithmetic and formatting. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, API-key injection and session-mode key removal, usage reporting from Claude's JSON envelope and the plain-text fallback, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
+The suite contains unit tests for remote parsing, repository address parsing, the access check, managed clones, settings migration, per-repository overrides, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, repository inspection, credential resolution, environment composition, and token-usage arithmetic and formatting. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, API-key injection and session-mode key removal, usage reporting from Claude's JSON envelope and the plain-text fallback, reviewer-disagreement reconciliation, per-repository policy and prompt overrides, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
 
 ## Roadmap
 
