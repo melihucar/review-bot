@@ -127,7 +127,7 @@ Example:
 
 ## Per-repository settings
 
-Every repository in Settings → Repositories has a **Customize…** button. It opens a sheet with two independent overrides; anything you leave alone follows the global setting, including later changes to it.
+Every repository in Settings → Repositories has a **Customize…** button (Settings → Repositories → Customize…). It opens a sheet with two independent overrides; anything you leave alone follows the global setting, including later changes to it.
 
 - **Decision policy.** Switch on "Use a different decision policy for this repository" to choose what Review Bot does on GitHub for `SHOULD_FIX`, `NITS_ONLY`, and `CLEAN` in this repository only. With the switch off, the repository follows the global policy.
 - **Review instructions.** Text that is either added to the global custom instructions (the default) or sent instead of them. An empty field always means "inherit": a blank prompt never removes the global one.
