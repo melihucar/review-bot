@@ -133,6 +133,7 @@ VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>
 
     static func combined(
         with customization: String,
+        repositoryCustomization: String = "",
         repositoryRules: String?,
         pullRequestFacts: String? = nil
     ) -> String {
@@ -148,6 +149,15 @@ VERDICT: <BLOCKING | SHOULD_FIX | NITS_ONLY | CLEAN>
 
         if !trimmed.isEmpty {
             prompt += "\n\n## Developer-specific review instructions\n" + trimmed
+        }
+
+        // After the global instructions, so the more specific text is read later, and before
+        // REVIEW.md, which stays last: those are the repository's own base-commit rules.
+        let repositoryTrimmed = repositoryCustomization.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !repositoryTrimmed.isEmpty {
+            prompt += "\n\n## Developer-specific review instructions for this repository\n"
+                + "These apply to this repository only and take precedence over any developer-specific instructions above.\n\n"
+                + repositoryTrimmed
         }
 
         if let repositoryRules {

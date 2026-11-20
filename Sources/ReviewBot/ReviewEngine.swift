@@ -410,6 +410,7 @@ actor ReviewEngine {
         let pullRequest = pendingReview.summary
         let metadata = pendingReview.metadata
         let repository = pendingReview.repository
+        let effective = configuration.effectiveSettings(for: repository)
         var worktreeURL: URL?
         var worktreeAdded = false
         var spent: TokenUsage?
@@ -472,6 +473,7 @@ actor ReviewEngine {
 
             let results = await runReviewers(
                 configuration: configuration,
+                settings: effective,
                 worktree: worktree,
                 repositoryRules: await loadRepositoryReviewRules(
                     repository: repository,
@@ -518,7 +520,7 @@ actor ReviewEngine {
                 )
             }
 
-            let policy = configuration.decisionPolicy
+            let policy = effective.decisionPolicy
             let strictDecision = DecisionEvaluator.evaluate(results, policy: policy)
             var decision = strictDecision
             // The adjudication that *decided* the review — nil when reconciliation produced no
@@ -582,6 +584,7 @@ actor ReviewEngine {
                 adjudication: adjudication,
                 guardReason: guardReason,
                 approvalWithheldForPartialPanel: approvalWithheld,
+                usesRepositoryDecisionPolicy: effective.usesRepositoryDecisionPolicy,
                 diffTruncation: context.diffTruncation,
                 usageReport: usageReport(
                     results: results,
@@ -646,6 +649,7 @@ actor ReviewEngine {
                 " Reconciled by \($0.reviewer.rawValue) → \($0.verdict?.rawValue ?? "unavailable")."
             } ?? ""
             let withheldNote = approvalWithheld ? " Approval withheld: partial panel." : ""
+            let policyNote = effective.usesRepositoryDecisionPolicy ? " Repository decision policy." : ""
             // Recorded whether or not the report is posted, so spend stays traceable either way.
             let total = spent
             let usageNote = total.map { usage in
@@ -657,7 +661,7 @@ actor ReviewEngine {
                 kind: decision.historyKind,
                 repository: repository,
                 pullRequest: pullRequest,
-                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(withheldNote)\(usageNote)",
+                message: "\(decision.title) — \(verdicts).\(reconciledNote)\(withheldNote)\(policyNote)\(usageNote)",
                 usage: total,
                 onEvent: onEvent
             )
@@ -1321,13 +1325,15 @@ actor ReviewEngine {
 
     private func runReviewers(
         configuration: ReviewBotConfiguration,
+        settings: EffectiveReviewSettings,
         worktree: URL,
         repositoryRules: String?,
         pullRequestFacts: String?,
         credentials: ResolvedCredentials
     ) async -> [ReviewerResult] {
         let prompt = DefaultPrompt.combined(
-            with: configuration.customPrompt,
+            with: settings.developerPrompt,
+            repositoryCustomization: settings.repositoryPrompt,
             repositoryRules: repositoryRules,
             pullRequestFacts: pullRequestFacts
         )
@@ -2183,6 +2189,7 @@ actor ReviewEngine {
         adjudication: ReviewerResult?,
         guardReason: InjectionGuard.Reason?,
         approvalWithheldForPartialPanel: Bool,
+        usesRepositoryDecisionPolicy: Bool,
         diffTruncation: DiffBudget.Outcome,
         usageReport: String?
     ) -> String {
@@ -2201,18 +2208,21 @@ actor ReviewEngine {
             </details>
             """
         }.joined(separator: "\n\n")
+        let policyName = usesRepositoryDecisionPolicy
+            ? "this repository's decision policy"
+            : "the current decision policy"
         let note: String
         switch decision {
         case .approve:
-            note = "No reviewer found an issue the current decision policy blocks on."
+            note = "No reviewer found an issue \(policyName) blocks on."
         case .requestChanges:
-            note = "At least one reviewer found an issue the current decision policy treats as blocking."
+            note = "At least one reviewer found an issue \(policyName) treats as blocking."
         case .comment:
             if approvalWithheldForPartialPanel {
                 note = "The decision policy would approve this, but **a partial panel never approves**, so it posts as a neutral comment. Re-request the review once every enabled reviewer can run."
             } else {
                 note = guardReason == nil
-                    ? "This review is neutral because the current decision policy leaves this severity to you."
+                    ? "This review is neutral because \(policyName) leaves this severity to you."
                     : "An automated injection check flagged this approval as unsafe, so the review posts as a neutral comment instead."
             }
         }
