@@ -340,6 +340,82 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertNil(reloaded.head(for: "acme/widget#99"))
     }
 
+    func testALegacyRepositoryEntryIsAFolderRepository() throws {
+        let json = #"""
+        {
+          "repositories": [
+            { "id": "6F9619FF-8B86-D011-B42D-00C04FC964FF", "name": "widget",
+              "path": "/projects/widget", "githubSlug": "acme/widget", "enabled": false }
+          ]
+        }
+        """#
+
+        let repository = try XCTUnwrap(
+            JSONDecoder().decode(ReviewBotConfiguration.self, from: Data(json.utf8)).repositories.first
+        )
+
+        XCTAssertNil(repository.managedClone)
+        XCTAssertFalse(repository.isManaged)
+        XCTAssertFalse(repository.enabled)
+        XCTAssertEqual(repository.path, "/projects/widget")
+    }
+
+    func testAManagedRepositoryRoundTripsThroughTheConfiguration() throws {
+        let managed = RepositoryConfiguration(
+            name: "widget",
+            path: "/data/repositories/acme/widget.git",
+            githubSlug: "acme/widget",
+            managedClone: .ssh
+        )
+        var configuration = ReviewBotConfiguration.default
+        configuration.repositories = [managed]
+
+        let decoded = try JSONDecoder().decode(
+            ReviewBotConfiguration.self,
+            from: try JSONEncoder().encode(configuration)
+        )
+
+        XCTAssertEqual(decoded.repositories, [managed])
+        XCTAssertTrue(decoded.repositories[0].isManaged)
+    }
+
+    func testAnUnknownCloneTransportLoadsAsAFolderWithoutLosingTheConfiguration() throws {
+        let json = #"""
+        {
+          "pollIntervalMinutes": 30,
+          "repositories": [
+            { "name": "widget", "path": "/x", "githubSlug": "acme/widget",
+              "managedClone": "carrier-pigeon" }
+          ]
+        }
+        """#
+
+        let configuration = try JSONDecoder().decode(ReviewBotConfiguration.self, from: Data(json.utf8))
+
+        XCTAssertNil(configuration.repositories.first?.managedClone)
+        XCTAssertEqual(configuration.pollIntervalMinutes, 30)
+    }
+
+    func testARepositoryEntryMissingFieldsStillDecodes() throws {
+        let json = #"{"repositories":[{"githubSlug":"acme/widget","path":"/x"}]}"#
+
+        let repository = try XCTUnwrap(
+            JSONDecoder().decode(ReviewBotConfiguration.self, from: Data(json.utf8)).repositories.first
+        )
+
+        XCTAssertTrue(repository.enabled)
+        XCTAssertEqual(repository.name, "widget")
+        XCTAssertEqual(repository.githubSlug, "acme/widget")
+    }
+
+    func testAFolderRepositoryIsEncodedWithoutACloneTransport() throws {
+        let folder = RepositoryConfiguration(name: "widget", path: "/projects/widget", githubSlug: "acme/widget")
+
+        let json = try XCTUnwrap(String(data: JSONEncoder().encode(folder), encoding: .utf8))
+
+        XCTAssertFalse(json.contains("managedClone"))
+    }
+
     func testFailureBudgetDecodesWithABoundedDefault() throws {
         XCTAssertEqual(ReviewBotConfiguration.default.failureBudget, .attempts(5))
 
