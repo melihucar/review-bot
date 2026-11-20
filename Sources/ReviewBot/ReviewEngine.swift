@@ -32,6 +32,7 @@ actor ReviewEngine {
     private let now: @Sendable () -> Date
     /// Serializes the git steps of concurrent reviews that share a clone.
     private let gitGate = RepositoryGate()
+    private let managedClones: ManagedClone
 
     private struct PendingPullRequest: Sendable {
         let summary: PullRequestSummary
@@ -59,6 +60,7 @@ actor ReviewEngine {
         lastReviewed = LastReviewedStore(paths: paths)
         attempts = ReviewAttemptStore(paths: paths, now: now())
         logger = ActivityLogger(directory: paths.logsDirectory)
+        managedClones = ManagedClone(paths: paths, runner: runner)
         try? paths.prepare()
     }
 
@@ -72,7 +74,7 @@ actor ReviewEngine {
         onEvent: @escaping EventSink,
         onStatus: @escaping StatusSink
     ) async {
-        let repositories = configuration.repositories.filter(\.enabled)
+        let repositories = configuration.repositories.filter(\.enabled).map(locatingManagedClone)
         guard !repositories.isEmpty else {
             await onStatus("Add and enable a repository to begin")
             return
@@ -712,6 +714,34 @@ actor ReviewEngine {
         }
     }
 
+    /// A managed repository lives where Review Bot put it, whatever `config.json` says.
+    private func locatingManagedClone(_ repository: RepositoryConfiguration) -> RepositoryConfiguration {
+        guard let directory = ManagedClone.directory(for: repository, in: paths) else { return repository }
+        var located = repository
+        located.path = directory.path
+        return located
+    }
+
+    /// Makes the clone of a repository that was just added by address, so a clone that cannot
+    /// work is reported to the person adding it rather than as a failed review later.
+    func prepareManagedClone(for repository: RepositoryConfiguration) async throws {
+        await gitGate.acquire(repository.githubSlug)
+        do {
+            _ = try await managedClones.ensure(repository)
+        } catch {
+            await gitGate.release(repository.githubSlug)
+            throw error
+        }
+        await gitGate.release(repository.githubSlug)
+    }
+
+    /// Deletes a removed repository's clone, once any review reading it has let go of the gate.
+    func removeManagedClone(of repository: RepositoryConfiguration) async {
+        await gitGate.acquire(repository.githubSlug)
+        managedClones.remove(repository)
+        await gitGate.release(repository.githubSlug)
+    }
+
     /// Fetches the pull request and checks its head out in a fresh worktree.
     ///
     /// Held under `gitGate` for the whole sequence: reviews now overlap, and two of
@@ -735,6 +765,11 @@ actor ReviewEngine {
         var headTip: String?
         await gitGate.acquire(repository.githubSlug)
         do {
+            // A repository added by address has no clone until Review Bot makes one, and may have
+            // lost it since. Inside the gate, so two reviews of one repository cannot both clone it.
+            if repository.isManaged, try await managedClones.ensure(repository).cloned {
+                await logger.append("Cloned \(repository.githubSlug) into Review Bot's data folder.")
+            }
             var fetchArguments = [
                 "-C", repository.path,
                 "fetch", "--quiet", "origin",

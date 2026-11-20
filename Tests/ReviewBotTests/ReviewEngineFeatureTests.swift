@@ -45,6 +45,117 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(sawPreparedDiff)
     }
 
+    func testAManagedRepositoryIsClonedThenReviewed() async throws {
+        let fixture = try FeatureFixture(
+            repository: RepositoryConfiguration(
+                name: "widget",
+                path: "/stale/from/config",
+                githubSlug: "acme/widget",
+                managedClone: .https
+            )
+        )
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let commands = await runner.commands()
+        let cloneDirectory = fixture.root.appendingPathComponent("repositories/acme/widget.git").path
+        XCTAssertEqual(events.map(\.kind), [.requestDetected, .reviewStarted, .approved])
+        let cloneIndex = try XCTUnwrap(commands.firstIndex { $0.starts(with: ["git", "clone"]) })
+        let fetchIndex = try XCTUnwrap(commands.firstIndex { $0.contains("fetch") })
+        XCTAssertEqual(commands.filter { $0.starts(with: ["git", "clone"]) }.count, 1)
+        XCTAssertLessThan(cloneIndex, fetchIndex)
+        let gitDirectories = commands.compactMap { command -> String? in
+            guard command.first == "git", let flag = command.firstIndex(of: "-C") else { return nil }
+            return command[flag + 1]
+        }
+        XCTAssertFalse(gitDirectories.isEmpty)
+        XCTAssertTrue(gitDirectories.filter { $0 != cloneDirectory }.allSatisfy { $0.hasPrefix(fixture.paths.worktreesDirectory.path) })
+        XCTAssertTrue(gitDirectories.contains(cloneDirectory))
+        XCTAssertFalse(commands.contains { $0.contains("/stale/from/config") })
+        let fetch = await runner.fetchInvocation() ?? []
+        XCTAssertTrue(fetch.contains("+refs/heads/main:refs/remotes/origin/main"))
+        let gitEnvironment = await runner.gitEnvironment()
+        XCTAssertEqual(gitEnvironment["GIT_TERMINAL_PROMPT"] ?? nil, "0")
+    }
+
+    func testAnExistingManagedCloneIsNotClonedAgain() async throws {
+        let fixture = try FeatureFixture(
+            repository: RepositoryConfiguration(
+                name: "widget",
+                path: "/stale/from/config",
+                githubSlug: "acme/widget",
+                managedClone: .https
+            )
+        )
+        try simulateBareClone(at: fixture.root.appendingPathComponent("repositories/acme/widget.git").path)
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let commands = await runner.commands()
+        let postCount = await runner.postCount()
+        XCTAssertFalse(commands.contains { $0.starts(with: ["git", "clone"]) })
+        XCTAssertEqual(postCount, 1)
+    }
+
+    func testAFailedManagedCloneFailsTheReviewWithoutFetching() async throws {
+        let fixture = try FeatureFixture(
+            repository: RepositoryConfiguration(
+                name: "widget",
+                path: "/stale/from/config",
+                githubSlug: "acme/widget",
+                managedClone: .https
+            )
+        )
+        let runner = ReviewWorkflowMock(failClone: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let fetch = await runner.fetchInvocation()
+        let postCount = await runner.postCount()
+        XCTAssertEqual(events.last?.kind, .failed)
+        XCTAssertTrue(events.last?.message.contains("Could not clone acme/widget over HTTPS") == true)
+        XCTAssertNil(fetch)
+        XCTAssertEqual(postCount, 0)
+    }
+
+    func testAFolderRepositoryIsNeverCloned() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let commands = await runner.commands()
+        XCTAssertFalse(commands.contains { $0.starts(with: ["git", "clone"]) })
+        XCTAssertTrue(commands.contains { $0.contains("/mock/widget") })
+    }
+
     func testAlreadyReviewedRequestIsNotRunOrPostedAgain() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock()
@@ -2465,19 +2576,19 @@ private struct FeatureFixture {
     let paths: StoragePaths
     let configuration: ReviewBotConfiguration
 
-    init() throws {
+    init(
+        repository: RepositoryConfiguration = RepositoryConfiguration(
+            name: "widget",
+            path: "/mock/widget",
+            githubSlug: "acme/widget"
+        )
+    ) throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ReviewBotFeatureTests-\(UUID().uuidString)", isDirectory: true)
         paths = StoragePaths(root: root)
         try paths.prepare()
         configuration = ReviewBotConfiguration(
-            repositories: [
-                RepositoryConfiguration(
-                    name: "widget",
-                    path: "/mock/widget",
-                    githubSlug: "acme/widget"
-                ),
-            ],
+            repositories: [repository],
             pollIntervalMinutes: 15,
             isPaused: false,
             claude: ReviewerConfiguration(enabled: true, model: "claude-test", effort: .high),
@@ -2646,6 +2757,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// diff` fails with the exact HTTP 406 text GitHub sends, and `fullPullRequestDiff` must
     /// fall back to a locally-computed three-dot diff rather than abandon the review.
     private let failGhPrDiff: Bool
+    /// Fails the `git clone --bare` a managed repository makes the first time it is reviewed.
+    private let failClone: Bool
     /// Shared with a credential store so a test can tell whether keys were resolved before or
     /// after the reviewers fanned out. `nil` for every test that does not care.
     private let spawnClock: ReviewerSpawnClock?
@@ -2761,9 +2874,11 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// `gh pr diff` fails with the exact HTTP 406 text GitHub sends, and `fullPullRequestDiff`
         /// must fall back to a locally-computed three-dot diff rather than abandon the review.
         failGhPrDiff: Bool = false,
+        failClone: Bool = false,
         spawnClock: ReviewerSpawnClock? = nil
     ) {
         self.spawnClock = spawnClock
+        self.failClone = failClone
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
         self.codexVerdict = codexVerdict
@@ -2874,6 +2989,15 @@ private actor ReviewWorkflowMock: CommandRunning {
                 return result(exitCode: 1, stderr: "simulated timeline failure")
             }
             return result(stdout: emptyTimeline ? "" : "2026-07-15T10:00:00Z\n")
+        }
+        // Must precede the `fetch` branch: a clone is the one git call that has no `-C`, and its
+        // last argument is the directory the engine will rename into place.
+        if executable == "git", arguments.first == "clone" {
+            if failClone {
+                return result(exitCode: 128, stderr: "fatal: repository 'https://github.com/acme/widget.git/' not found")
+            }
+            try simulateBareClone(at: arguments.last!)
+            return result()
         }
         if executable == "git", arguments.contains("fetch") {
             fetchArgs = arguments
@@ -3231,6 +3355,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     func geminiWorkspaceEnvExistedAtInvocation() -> Bool { geminiWorkspaceEnvExists }
     func reconciliationCount() -> Int { reconciliationAdjudicators.count }
     func reconciliationAdjudicator() -> ReviewerName? { reconciliationAdjudicators.last }
+    func gitEnvironment() -> EnvironmentOverrides { environmentByExecutable["git"] ?? [:] }
     func claudeEnvironment() -> EnvironmentOverrides { environmentByExecutable["claude"] ?? [:] }
     func codexEnvironment() -> EnvironmentOverrides { environmentByExecutable["codex"] ?? [:] }
     func opencodeEnvironment() -> EnvironmentOverrides { environmentByExecutable["opencode"] ?? [:] }
