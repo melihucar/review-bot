@@ -11,6 +11,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-20
+
 ### Added
 
 - **Give one repository its own decision policy and review instructions.** Every repository in Settings → Repositories now has a **Customize…** button (Settings → Repositories → Customize…). It opens a sheet where that repository can use a different decision policy — what Review Bot does on GitHub for `SHOULD_FIX`, `NITS_ONLY` and `CLEAN` — and carry review instructions of its own. Those instructions are either added after the global ones, which is the default, or sent instead of them; they always come before the repository's `REVIEW.md`, which keeps the last word. Leaving the instructions empty keeps the global ones, so a blank field never removes them. A repository you have not customized behaves exactly as before and follows the global settings, including later changes to them, and a customized one says so on its row. **Reset to global** clears both. The safeguards do not move with the policy: `BLOCKING` always requests changes, a partial panel never approves, and the injection check still runs. When a repository's own policy decided a review, the posted review and the activity history say so.
@@ -254,7 +256,8 @@ behaviour; every other reviewer works exactly as it did in 0.1.16.
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/melihucar/review-bot/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/melihucar/review-bot/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/melihucar/review-bot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/melihucar/review-bot/compare/v0.2.0...v0.3.0
