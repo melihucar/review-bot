@@ -19,6 +19,11 @@ final class AppModel: ObservableObject {
     /// it was still running.
     @Published private(set) var runningReviews: [ReviewQueueItem] = []
     @Published var errorMessage: String?
+    /// Non-nil while a repository is being added by address: what the add is doing right now.
+    @Published private(set) var repositoryAdditionProgress: String?
+    /// Why the last add-by-address failed. Shown beside the field, not in the alert, so the
+    /// address stays in view to be corrected.
+    @Published var repositoryAdditionError: String?
 
     let settings: SettingsStore
     let history: HistoryStore
@@ -30,14 +35,18 @@ final class AppModel: ObservableObject {
     private var schedulerTask: Task<Void, Never>?
     private var settingsWindowController: NSWindowController?
     private var hasStarted = false
+    /// Managed clones whose repositories were removed while a poll was running. Deleting one
+    /// mid-review would take away the clone a review reads `REVIEW.md` from.
+    private var managedClonesAwaitingRemoval: [RepositoryConfiguration] = []
 
     init(
         paths: StoragePaths = StoragePaths(),
-        credentials: any CredentialStoring = KeychainCredentialStore()
+        credentials: any CredentialStoring = KeychainCredentialStore(),
+        runner: any CommandRunning = ProcessRunner()
     ) {
         self.paths = paths
         self.credentials = credentials
-        runner = ProcessRunner()
+        self.runner = runner
         settings = SettingsStore(paths: paths)
         history = HistoryStore(paths: paths)
         engine = ReviewEngine(paths: paths, runner: runner, credentials: credentials)
@@ -75,12 +84,102 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             do {
                 let repository = try await RepositoryInspector(runner: runner).inspect(folder: folder)
+                guard !settings.containsRepository(withSlug: repository.githubSlug) else {
+                    errorMessage = "\(repository.githubSlug) is already in the list."
+                    return
+                }
                 settings.add(repository)
                 status = "Added \(repository.name)"
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    /// Adds a repository by its GitHub address: confirms through `gh` that the account can read
+    /// it, makes Review Bot's own clone, and only then records it. A failure adds nothing.
+    @discardableResult
+    func addRepository(address input: String) async -> Bool {
+        guard repositoryAdditionProgress == nil else { return false }
+        repositoryAdditionError = nil
+        repositoryAdditionProgress = "Checking the address…"
+        defer { repositoryAdditionProgress = nil }
+
+        do {
+            let typed = try GitHubRepositoryAddress.parse(input)
+            guard !settings.containsRepository(withSlug: typed.slug) else {
+                throw RepositoryAdditionError.alreadyListed(typed.slug)
+            }
+
+            repositoryAdditionProgress = "Checking your access to \(typed.slug)…"
+            let access = try await RepositoryAccessChecker(runner: runner).check(typed)
+            // GitHub's canonical name can differ from what was typed (casing, a rename).
+            guard !settings.containsRepository(withSlug: access.address.slug) else {
+                throw RepositoryAdditionError.alreadyListed(access.address.slug)
+            }
+
+            let repository = RepositoryConfiguration(
+                name: access.address.name,
+                path: paths.managedCloneDirectory(for: access.address).path,
+                githubSlug: access.address.slug,
+                managedClone: access.address.transport
+            )
+            repositoryAdditionProgress = "Cloning \(access.address.slug)… A large repository can take a few minutes."
+            try await engine.prepareManagedClone(for: repository)
+
+            // The clone can take minutes, and the same repository may have been added by folder
+            // meanwhile. Nothing else owns this clone yet, so it goes with the refused add.
+            guard settings.add(repository) else {
+                await discardManagedClone(of: repository)
+                throw RepositoryAdditionError.alreadyListed(repository.githubSlug)
+            }
+            status = "Added \(repository.githubSlug) — \(access.permission.rawValue) access"
+            return true
+        } catch {
+            repositoryAdditionError = error.localizedDescription
+            return false
+        }
+    }
+
+    private enum RepositoryAdditionError: LocalizedError {
+        case alreadyListed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .alreadyListed(slug): "\(slug) is already in the list."
+            }
+        }
+    }
+
+    func removeRepository(_ id: RepositoryConfiguration.ID) async {
+        await removeRepositories([id])
+    }
+
+    func removeRepositories(_ ids: [RepositoryConfiguration.ID]) async {
+        let removed = settings.configuration.repositories.filter { ids.contains($0.id) }
+        for id in ids {
+            settings.removeRepository(id)
+        }
+        await discardManagedClones(of: removed)
+    }
+
+    private func discardManagedClones(of repositories: [RepositoryConfiguration]) async {
+        for repository in repositories where repository.isManaged {
+            if isRunning {
+                managedClonesAwaitingRemoval.append(repository)
+            } else {
+                await discardManagedClone(of: repository)
+            }
+        }
+    }
+
+    private func discardManagedClone(of repository: RepositoryConfiguration) async {
+        // Another entry for the same repository would share this clone.
+        let stillListed = settings.configuration.repositories.contains {
+            $0.isManaged && $0.githubSlug.caseInsensitiveCompare(repository.githubSlug) == .orderedSame
+        }
+        guard !stillListed else { return }
+        await engine.removeManagedClone(of: repository)
     }
 
     func refreshToolAvailability() async {
@@ -378,6 +477,14 @@ final class AppModel: ObservableObject {
                 }
             }
         )
+
+        // In the body rather than the `defer`: `defer` cannot await, and `isRunning` must still
+        // be set so a removal arriving meanwhile queues instead of deleting under a review.
+        // Popped one at a time: a removal arriving during one of these awaits is still queued
+        // because `isRunning` is set, and the loop must pick it up rather than lose it.
+        while !managedClonesAwaitingRemoval.isEmpty {
+            await discardManagedClone(of: managedClonesAwaitingRemoval.removeFirst())
+        }
     }
 
     private func updateQueue(for entry: HistoryEntry) {

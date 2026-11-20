@@ -11,6 +11,15 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Added
+
+- **Add a repository by its GitHub address, without cloning it yourself.** Dashboard → Repositories now takes an HTTPS or SSH address — `https://github.com/owner/repo`, `git@github.com:owner/repo.git`, `ssh://git@github.com/owner/repo.git`, or just `owner/repo` — next to the folder picker. Review Bot first asks GitHub, through your `gh` login, whether your account can see the repository and what it may do there, and adds it only if the answer is yes: a repository that does not exist or that you have no access to is refused with the reason, as are an address that is not on github.com and a `gh` that is not signed in. Read access is enough, because that is all GitHub asks of a reviewer; the level you hold is shown when the repository is added. Review Bot then keeps its own bare clone under `~/Library/Application Support/ReviewBot/repositories/`. It is made the moment you add the repository, so a clone that cannot work — an SSH key the app cannot reach, say — is reported then rather than as a failed review later; it is made again automatically if it ever goes missing, and deleted when you remove the repository. An HTTPS address is cloned and fetched with your `gh` credentials, so it works wherever `gh` does and needs no Git credential setup; an SSH address uses your own SSH configuration. Credentials typed into an address are discarded, never stored. Repositories added from a folder work exactly as before.
+
+### Changed
+
+- **`config.json` survives a repository entry with missing fields.** Recording how a repository was added meant giving repository entries the same defensive decoder the reviewer settings have, so a hand-edited or older entry no longer throws the whole file away and resets every other setting with it.
+- **A repository that is already in the list is refused rather than added twice.** Two entries for one GitHub repository each discovered the same review request, so the pull request was reviewed — and posted to — twice. Adding by folder now says so when the repository is already listed, the same as adding by address.
+
 ## [0.4.0] - 2026-09-24
 
 ### Added

@@ -1,12 +1,12 @@
 # Review Bot
 
-Review Bot is a native macOS menu-bar app that watches local GitHub repositories for pull requests requesting a review from the signed-in `gh` user. It reviews each new request in an isolated Git worktree with Claude, Codex, opencode, Gemini, or any combination, then submits an approval, change request, or neutral review to GitHub.
+Review Bot is a native macOS menu-bar app that watches local or address-added GitHub repositories for pull requests requesting a review from the signed-in `gh` user. It reviews each new request in an isolated Git worktree with Claude, Codex, opencode, Gemini, or any combination, then submits an approval, change request, or neutral review to GitHub.
 
 GitHub access always goes through your authenticated `gh` CLI — the app never handles GitHub credentials. AI access defaults to the same model: each reviewer CLI uses its own existing login. If you would rather bill a specific API key, Claude and Codex accept one; keys are stored in the macOS Keychain and never written to `config.json`.
 
 ## Features
 
-- Add and independently enable multiple local Git repositories.
+- Add and independently enable multiple local or address-added GitHub repositories.
 - Poll every 5, 15, or 30 minutes, or every hour.
 - Pause and resume automatic monitoring from the menu bar or settings.
 - See explicit Pending and Running review queues in the menu-bar popover.
@@ -36,7 +36,7 @@ GitHub access always goes through your authenticated `gh` CLI — the app never 
   - `claude` — authenticated, or an Anthropic API key.
   - `codex` — authenticated, or an OpenAI API key.
   - `opencode` — authenticated through its own configuration. Opt-in; defaults to the free `opencode/deepseek-v4-flash-free` model at max effort.
-- Local Git repositories with an `origin` remote on `github.com`.
+- A local Git repository with an `origin` remote on `github.com`, or just its GitHub address.
 
 The configured GitHub account needs permission to read the repository and submit pull-request reviews.
 
@@ -68,8 +68,8 @@ Launch-at-login registration only works reliably from the packaged app in `/Appl
 ## First-time setup
 
 1. Open the menu-bar icon and choose **Settings…**.
-2. Add one or more local Git repository folders.
-3. Confirm the inferred `owner/repository` GitHub slug.
+2. Paste a repository's GitHub address, or choose a folder you already cloned.
+3. Confirm the `owner/repository` GitHub slug.
 4. Enable Claude, Codex, opencode, or Gemini and set their model and effort values. opencode and Gemini are off by default.
 5. Choose a polling interval.
 6. Optionally add global custom review instructions.
@@ -183,6 +183,7 @@ Review Bot writes to:
 ├── opencode/
 ├── gemini/
 ├── logs/
+├── repositories/
 ├── reviews/
 └── worktrees/
 ```
@@ -192,6 +193,7 @@ Review Bot writes to:
 - `reviewed.json` contains deduplication keys.
 - `logs/` contains daily operational logs.
 - `reviews/` contains the aggregated Markdown submitted to GitHub.
+- `repositories/` holds the bare clones Review Bot keeps for repositories added by address; each is deleted when its repository is removed.
 - `worktrees/` is temporary and normally empty between reviews.
 - `opencode/` holds the read-only agent definition the opencode reviewer runs under.
 - `gemini/` holds the read-only policy file the Gemini reviewer runs under.
@@ -213,7 +215,7 @@ Use **History → Show data folder** to open this location.
 make test
 ```
 
-The suite contains unit tests for remote parsing, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, repository inspection, credential resolution, environment composition, and token-usage arithmetic and formatting. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, API-key injection and session-mode key removal, usage reporting from Claude's JSON envelope and the plain-text fallback, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
+The suite contains unit tests for remote parsing, repository address parsing, the access check, managed clones, settings migration, prompt composition, verdict parsing, decision precedence, gate-disagreement detection, repository inspection, credential resolution, environment composition, and token-usage arithmetic and formatting. Mocked feature tests exercise the complete polling and review workflow, including worktree preparation, trusted `REVIEW.md` injection, Claude approval, Codex change requests, API-key injection and session-mode key removal, usage reporting from Claude's JSON envelope and the plain-text fallback, reviewer-disagreement reconciliation, deduplication, failed-post history, and retry behavior without accessing GitHub or an AI provider.
 
 ## Roadmap
 

@@ -22,6 +22,8 @@ struct StoragePaths {
     var lastReviewedFile: URL { root.appendingPathComponent("last-reviewed.json") }
     var attemptsFile: URL { root.appendingPathComponent("attempts.json") }
     var worktreesDirectory: URL { root.appendingPathComponent("worktrees", isDirectory: true) }
+    /// Clones Review Bot made itself, for repositories added by address rather than by folder.
+    var repositoriesDirectory: URL { root.appendingPathComponent("repositories", isDirectory: true) }
     var reviewsDirectory: URL { root.appendingPathComponent("reviews", isDirectory: true) }
     var logsDirectory: URL { root.appendingPathComponent("logs", isDirectory: true) }
     /// Configuration Review Bot injects into the opencode reviewer (read-only
@@ -42,10 +44,18 @@ struct StoragePaths {
         geminiConfigDirectory.appendingPathComponent("read-only.toml")
     }
 
+    /// Takes a validated address, never a raw string, so `..` cannot be expressed.
+    func managedCloneDirectory(for address: GitHubRepositoryAddress) -> URL {
+        repositoriesDirectory
+            .appendingPathComponent(address.owner.lowercased(), isDirectory: true)
+            .appendingPathComponent("\(address.name.lowercased()).git", isDirectory: true)
+    }
+
     func prepare() throws {
         for directory in [
             root,
             worktreesDirectory,
+            repositoriesDirectory,
             reviewsDirectory,
             logsDirectory,
             opencodeConfigDirectory,
@@ -88,8 +98,18 @@ final class SettingsStore: ObservableObject {
         )
     }
 
-    func removeRepositories(at offsets: IndexSet) {
-        configuration.repositories.remove(atOffsets: offsets)
+    func containsRepository(withSlug slug: String) -> Bool {
+        configuration.repositories.contains {
+            $0.githubSlug.caseInsensitiveCompare(slug) == .orderedSame
+        }
+    }
+
+    /// Returns whether the repository was added; `false` means its slug was already listed.
+    @discardableResult
+    func add(_ repository: RepositoryConfiguration) -> Bool {
+        guard !containsRepository(withSlug: repository.githubSlug) else { return false }
+        configuration.repositories.append(repository)
+        return true
     }
 
     func removeRepository(_ id: RepositoryConfiguration.ID) {

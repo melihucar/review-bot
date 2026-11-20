@@ -40,6 +40,7 @@ struct DashboardView: View {
 private struct GeneralSettingsView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var settings: SettingsStore
+    @State private var repositoryAddress = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -117,24 +118,68 @@ private struct GeneralSettingsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Repositories")
                         .font(.title3.weight(.semibold))
-                    Text("Review Bot infers the GitHub repository from the folder's origin remote.")
+                    Text("Add a repository by its GitHub address, or choose a folder you already cloned.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button {
-                    chooseRepositoryFolder()
-                } label: {
-                    Label("Add repository", systemImage: "plus")
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    TextField(
+                        "https://github.com/owner/repository or git@github.com:owner/repository.git",
+                        text: $repositoryAddress
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+                    .disabled(isAdding)
+                    .onSubmit(addByAddress)
+
+                    Button("Add", action: addByAddress)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(
+                            isAdding
+                                || repositoryAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        )
+
+                    Button {
+                        chooseRepositoryFolder()
+                    } label: {
+                        Label("Choose folder…", systemImage: "folder")
+                    }
+                    .buttonStyle(.bordered)
                 }
-                .buttonStyle(.borderedProminent)
+
+                if let progress = model.repositoryAdditionProgress {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(progress)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let error = model.repositoryAdditionError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Text("HTTPS addresses use your gh login. SSH addresses use your SSH keys.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .onChange(of: repositoryAddress) { _, _ in
+                model.repositoryAdditionError = nil
             }
 
             if settings.configuration.repositories.isEmpty {
                 ContentUnavailableView {
                     Label("No repositories", systemImage: "folder.badge.plus")
                 } description: {
-                    Text("Add a local GitHub repository to start watching its review requests.")
+                    Text("Paste a GitHub address above, or choose a folder you already cloned.")
                 } actions: {
                     Button("Choose folder…") { chooseRepositoryFolder() }
                         .buttonStyle(.borderedProminent)
@@ -145,16 +190,31 @@ private struct GeneralSettingsView: View {
                     ForEach($settings.configuration.repositories) { $repository in
                         RepositoryRow(
                             repository: $repository,
-                            onDelete: { settings.removeRepository(repository.id) }
+                            onDelete: { Task { await model.removeRepository(repository.id) } }
                         )
                     }
-                    .onDelete(perform: settings.removeRepositories)
+                    .onDelete { offsets in
+                        // Resolved now: by the time the task runs, the list may have changed.
+                        let ids = offsets.map { settings.configuration.repositories[$0].id }
+                        Task { await model.removeRepositories(ids) }
+                    }
                 }
                 .listStyle(.inset)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             }
         }
         .padding(.top, 8)
+    }
+
+    private var isAdding: Bool { model.repositoryAdditionProgress != nil }
+
+    private func addByAddress() {
+        let address = repositoryAddress
+        Task {
+            if await model.addRepository(address: address) {
+                repositoryAddress = ""
+            }
+        }
     }
 
     private func chooseRepositoryFolder() {
@@ -195,19 +255,33 @@ private struct RepositoryRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(width: 48, alignment: .leading)
-                    TextField("owner/repository", text: $repository.githubSlug)
-                        .font(.caption.monospaced())
+                    if repository.isManaged {
+                        // The slug determines the clone, so it must not be edited.
+                        Text(repository.githubSlug)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                    } else {
+                        TextField("owner/repository", text: $repository.githubSlug)
+                            .font(.caption.monospaced())
+                    }
                 }
                 HStack(alignment: .top) {
-                    Text("Folder")
+                    Text(repository.isManaged ? "Clone" : "Folder")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(width: 48, alignment: .leading)
-                    Text(repository.path)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .textSelection(.enabled)
+                    if let transport = repository.managedClone {
+                        Text("Managed by Review Bot · \(transport.label)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help(repository.path)
+                    } else {
+                        Text(repository.path)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    }
                 }
             }
 
@@ -231,7 +305,11 @@ private struct RepositoryRow: View {
             Button("Remove repository", role: .destructive, action: onDelete)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Review Bot stops watching this repository. Your local files are not affected.")
+            Text(
+                repository.isManaged
+                    ? "Review Bot stops watching this repository and deletes the clone it keeps in its own data folder. Nothing else on your Mac is affected."
+                    : "Review Bot stops watching this repository. Your local files are not affected."
+            )
         }
     }
 }

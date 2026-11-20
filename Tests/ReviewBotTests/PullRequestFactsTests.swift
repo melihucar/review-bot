@@ -34,6 +34,15 @@ final class PullRequestFactsTests: XCTestCase {
         return try JSONDecoder().decode(PullRequestMetadata.self, from: data)
     }
 
+    func testTheStalenessWarningCoversReviewBotsOwnBareClone() throws {
+        let pr = try metadata(headRefName: "feature", isCrossRepository: false)
+
+        let rendered = PullRequestFacts(metadata: pr, headBranchTip: Self.headOid).render()
+
+        XCTAssertTrue(rendered.contains("Review Bot's own bare clone, whose local branches were frozen when it was cloned"))
+        XCTAssertTrue(rendered.contains("may be days out of date"))
+    }
+
     func testDecodingWithoutTheNewKeysStillSucceeds() throws {
         let json = """
         {"title":"Test PR","headRefOid":"\(Self.headOid)","baseRefName":"main","baseRefOid":"\(Self.baseOid)","url":"https://github.com/acme/widget/pull/1"}

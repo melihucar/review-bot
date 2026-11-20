@@ -166,11 +166,51 @@ struct ReviewerConfiguration: Codable, Equatable {
 }
 
 struct RepositoryConfiguration: Codable, Equatable, Identifiable {
-    var id = UUID()
+    var id: UUID
     var name: String
     var path: String
     var githubSlug: String
-    var enabled = true
+    var enabled: Bool
+    /// `nil`: `path` is a clone the developer owns. Non-nil: Review Bot owns the clone, keeps it
+    /// under `StoragePaths.repositoriesDirectory`, and derives its location and URL from
+    /// `githubSlug`. `path` is then informational only.
+    var managedClone: CloneTransport?
+
+    var isManaged: Bool { managedClone != nil }
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        path: String,
+        githubSlug: String,
+        enabled: Bool = true,
+        managedClone: CloneTransport? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.path = path
+        self.githubSlug = githubSlug
+        self.enabled = enabled
+        self.managedClone = managedClone
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, path, githubSlug, enabled, managedClone
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        path = try values.decodeIfPresent(String.self, forKey: .path) ?? ""
+        githubSlug = try values.decodeIfPresent(String.self, forKey: .githubSlug) ?? ""
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+            ?? githubSlug.split(separator: "/").last.map(String.init) ?? ""
+        enabled = try values.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        // Decoded as a string so a transport this build does not know loads as "not managed"
+        // instead of throwing the whole file away.
+        managedClone = ((try? values.decodeIfPresent(String.self, forKey: .managedClone)) ?? nil)
+            .flatMap(CloneTransport.init(rawValue:))
+    }
 }
 
 /// How many times one review request may fail — a reviewer that errors or returns
