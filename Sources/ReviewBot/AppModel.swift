@@ -127,7 +127,12 @@ final class AppModel: ObservableObject {
             repositoryAdditionProgress = "Cloning \(access.address.slug)… A large repository can take a few minutes."
             try await engine.prepareManagedClone(for: repository)
 
-            settings.add(repository)
+            // The clone can take minutes, and the same repository may have been added by folder
+            // meanwhile. Nothing else owns this clone yet, so it goes with the refused add.
+            guard settings.add(repository) else {
+                await discardManagedClone(of: repository)
+                throw RepositoryAdditionError.alreadyListed(repository.githubSlug)
+            }
             status = "Added \(repository.githubSlug) — \(access.permission.rawValue) access"
             return true
         } catch {
@@ -147,14 +152,14 @@ final class AppModel: ObservableObject {
     }
 
     func removeRepository(_ id: RepositoryConfiguration.ID) async {
-        let removed = settings.configuration.repositories.filter { $0.id == id }
-        settings.removeRepository(id)
-        await discardManagedClones(of: removed)
+        await removeRepositories([id])
     }
 
-    func removeRepositories(at offsets: IndexSet) async {
-        let removed = offsets.map { settings.configuration.repositories[$0] }
-        settings.removeRepositories(at: offsets)
+    func removeRepositories(_ ids: [RepositoryConfiguration.ID]) async {
+        let removed = settings.configuration.repositories.filter { ids.contains($0.id) }
+        for id in ids {
+            settings.removeRepository(id)
+        }
         await discardManagedClones(of: removed)
     }
 
@@ -475,10 +480,10 @@ final class AppModel: ObservableObject {
 
         // In the body rather than the `defer`: `defer` cannot await, and `isRunning` must still
         // be set so a removal arriving meanwhile queues instead of deleting under a review.
-        let awaitingRemoval = managedClonesAwaitingRemoval
-        managedClonesAwaitingRemoval.removeAll()
-        for repository in awaitingRemoval {
-            await discardManagedClone(of: repository)
+        // Popped one at a time: a removal arriving during one of these awaits is still queued
+        // because `isRunning` is set, and the loop must pick it up rather than lose it.
+        while !managedClonesAwaitingRemoval.isEmpty {
+            await discardManagedClone(of: managedClonesAwaitingRemoval.removeFirst())
         }
     }
 

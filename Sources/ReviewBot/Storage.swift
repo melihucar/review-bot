@@ -104,13 +104,12 @@ final class SettingsStore: ObservableObject {
         }
     }
 
-    func add(_ repository: RepositoryConfiguration) {
-        guard !containsRepository(withSlug: repository.githubSlug) else { return }
+    /// Returns whether the repository was added; `false` means its slug was already listed.
+    @discardableResult
+    func add(_ repository: RepositoryConfiguration) -> Bool {
+        guard !containsRepository(withSlug: repository.githubSlug) else { return false }
         configuration.repositories.append(repository)
-    }
-
-    func removeRepositories(at offsets: IndexSet) {
-        configuration.repositories.remove(atOffsets: offsets)
+        return true
     }
 
     func removeRepository(_ id: RepositoryConfiguration.ID) {

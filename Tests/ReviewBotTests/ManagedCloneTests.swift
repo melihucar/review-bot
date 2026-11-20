@@ -183,6 +183,16 @@ final class ManagedCloneTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: sibling.path))
     }
 
+    func testRemovalNeverWipesASiblingsIncomingClone() throws {
+        try simulateBareClone(at: cloneDirectory.path)
+        let incoming = cloneDirectory.deletingLastPathComponent().appendingPathComponent("other.git.incoming")
+        try simulateBareClone(at: incoming.path)
+
+        ManagedClone(paths: paths, runner: succeedingRunner()).remove(repository())
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: incoming.path))
+    }
+
     func testAFolderRepositoryHasNoManagedDirectory() {
         XCTAssertNil(ManagedClone.directory(for: repository(transport: nil), in: paths))
     }

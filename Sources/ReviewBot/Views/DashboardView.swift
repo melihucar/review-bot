@@ -194,7 +194,9 @@ private struct GeneralSettingsView: View {
                         )
                     }
                     .onDelete { offsets in
-                        Task { await model.removeRepositories(at: offsets) }
+                        // Resolved now: by the time the task runs, the list may have changed.
+                        let ids = offsets.map { settings.configuration.repositories[$0].id }
+                        Task { await model.removeRepositories(ids) }
                     }
                 }
                 .listStyle(.inset)

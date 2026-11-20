@@ -7,7 +7,8 @@
 /// could, in principle, tamper with — so these facts are stated in the prompt itself instead, where
 /// the "untrusted" framing does not apply.
 ///
-/// It exists because the worktree's `.git` entry points into a developer's ordinary working clone,
+/// It exists because the worktree's `.git` entry points into a clone — a developer's ordinary
+/// working clone, or Review Bot's own bare clone, whose local branches are frozen at clone time —
 /// which holds whatever it last happened to fetch. Review Bot refreshes only the base branch and,
 /// for a same-repository pull request, the head branch before a review — every other ref in that
 /// clone (local and remote-tracking branches, reflogs, `FETCH_HEAD`, `packed-refs`) can be
@@ -80,7 +81,7 @@ struct PullRequestFacts: Equatable {
 
         \(lines.joined(separator: "\n"))
 
-        The worktree's `.git` entry points into a developer's working clone. For this review Review Bot refreshed only \(refreshed); every other remote-tracking ref, local branch, reflog, `FETCH_HEAD` and `packed-refs` entry in that clone may be days out of date. Never use them to decide where a branch points, which branch this pull request comes from, or whether it is a side branch — the facts above answer those questions.
+        The worktree's `.git` entry points into the repository clone this review was cut from: either a developer's working clone, or Review Bot's own bare clone, whose local branches were frozen when it was cloned. For this review Review Bot refreshed only \(refreshed); every other remote-tracking ref, local branch, reflog, `FETCH_HEAD` and `packed-refs` entry in that clone may be days out of date. Never use them to decide where a branch points, which branch this pull request comes from, or whether it is a side branch — the facts above answer those questions.
         """
     }
 

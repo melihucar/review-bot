@@ -384,10 +384,8 @@ struct ManagedClone {
         guard let directory = Self.directory(for: repository, in: paths) else { return }
         try? FileManager.default.removeItem(at: directory)
         try? FileManager.default.removeItem(at: directory.appendingPathExtension("incoming"))
-        let ownerDirectory = directory.deletingLastPathComponent()
-        let remaining = (try? FileManager.default.contentsOfDirectory(atPath: ownerDirectory.path)) ?? []
-        if remaining.isEmpty {
-            try? FileManager.default.removeItem(at: ownerDirectory)
-        }
+        // `rmdir` only removes an empty directory. A recursive delete here could wipe a sibling
+        // clone's `.incoming` that appeared since the emptiness was checked.
+        rmdir(directory.deletingLastPathComponent().path)
     }
 }
