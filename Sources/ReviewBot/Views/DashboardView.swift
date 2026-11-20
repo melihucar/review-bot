@@ -351,6 +351,8 @@ private struct RepositoryCustomizationSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var draft: RepositoryOverrides
+    /// The last policy the toggle held, so switching it off and on again restores it.
+    @State private var rememberedPolicy: DecisionPolicy?
 
     init(
         repository: RepositoryConfiguration,
@@ -363,6 +365,7 @@ private struct RepositoryCustomizationSheet: View {
         self.hasGlobalPrompt = hasGlobalPrompt
         self.onSave = onSave
         _draft = State(initialValue: repository.overrides)
+        _rememberedPolicy = State(initialValue: repository.overrides.decisionPolicy)
     }
 
     var body: some View {
@@ -434,7 +437,7 @@ private struct RepositoryCustomizationSheet: View {
                     onSave(draft)
                     dismiss()
                 }
-                .keyboardShortcut(.defaultAction)
+                .keyboardShortcut(.return, modifiers: .command)
                 .buttonStyle(.borderedProminent)
             }
         }
@@ -445,7 +448,14 @@ private struct RepositoryCustomizationSheet: View {
     private var usesOwnPolicy: Binding<Bool> {
         Binding(
             get: { draft.decisionPolicy != nil },
-            set: { draft.decisionPolicy = $0 ? globalPolicy : nil }
+            set: { isOn in
+                if isOn {
+                    draft.decisionPolicy = rememberedPolicy ?? globalPolicy
+                } else {
+                    rememberedPolicy = draft.decisionPolicy ?? rememberedPolicy
+                    draft.decisionPolicy = nil
+                }
+            }
         )
     }
 

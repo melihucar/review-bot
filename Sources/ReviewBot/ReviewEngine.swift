@@ -2219,7 +2219,8 @@ actor ReviewEngine {
             note = "At least one reviewer found an issue \(policyName) treats as blocking."
         case .comment:
             if approvalWithheldForPartialPanel {
-                note = "The decision policy would approve this, but **a partial panel never approves**, so it posts as a neutral comment. Re-request the review once every enabled reviewer can run."
+                let subject = usesRepositoryDecisionPolicy ? "This repository's decision policy" : "The decision policy"
+                note = "\(subject) would approve this, but **a partial panel never approves**, so it posts as a neutral comment. Re-request the review once every enabled reviewer can run."
             } else {
                 note = guardReason == nil
                     ? "This review is neutral because \(policyName) leaves this severity to you."

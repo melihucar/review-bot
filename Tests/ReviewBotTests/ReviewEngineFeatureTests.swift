@@ -1206,6 +1206,32 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(postArgument, "--request-changes")
     }
 
+    func testARepositoryPolicyNeverApprovesAPartialPanel() async throws {
+        let fixture = try FeatureFixture(repository: widget(overrides: RepositoryOverrides(
+            decisionPolicy: DecisionPolicy(shouldFix: .requestChanges, nitsOnly: .approve, clean: .approve)
+        )))
+        let runner = ReviewWorkflowMock(claudeVerdict: .clean, failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let body = await runner.lastPostedBody()
+        XCTAssertEqual(postArgument, "--comment")
+        XCTAssertEqual(events.last?.kind, .commented)
+        XCTAssertFalse(events.contains { $0.kind == .approved })
+        XCTAssertTrue(body.contains("This repository's decision policy would approve this"))
+        XCTAssertTrue(body.contains("a partial panel never approves"))
+    }
+
     func testARepositoryPromptReachesTheReviewerAfterTheGlobalPromptAndBeforeReviewMd() async throws {
         let fixture = try FeatureFixture(repository: widget(overrides: RepositoryOverrides(
             prompt: "Billing code needs integration tests.",
