@@ -11,6 +11,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-20
+
 ### Added
 
 - **Add a repository by its GitHub address, without cloning it yourself.** Dashboard → Repositories now takes an HTTPS or SSH address — `https://github.com/owner/repo`, `git@github.com:owner/repo.git`, `ssh://git@github.com/owner/repo.git`, or just `owner/repo` — next to the folder picker. Review Bot first asks GitHub, through your `gh` login, whether your account can see the repository and what it may do there, and adds it only if the answer is yes: a repository that does not exist or that you have no access to is refused with the reason, as are an address that is not on github.com and a `gh` that is not signed in. Read access is enough, because that is all GitHub asks of a reviewer; the level you hold is shown when the repository is added. Review Bot then keeps its own bare clone under `~/Library/Application Support/ReviewBot/repositories/`. It is made the moment you add the repository, so a clone that cannot work — an SSH key the app cannot reach, say — is reported then rather than as a failed review later; it is made again automatically if it ever goes missing, and deleted when you remove the repository. An HTTPS address is cloned and fetched with your `gh` credentials, so it works wherever `gh` does and needs no Git credential setup; an SSH address uses your own SSH configuration. Credentials typed into an address are discarded, never stored. Repositories added from a folder work exactly as before.
@@ -248,7 +250,8 @@ behaviour; every other reviewer works exactly as it did in 0.1.16.
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/melihucar/review-bot/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/melihucar/review-bot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/melihucar/review-bot/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/melihucar/review-bot/compare/v0.1.16...v0.2.0
