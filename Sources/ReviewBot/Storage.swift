@@ -116,6 +116,12 @@ final class SettingsStore: ObservableObject {
         configuration.repositories.removeAll { $0.id == id }
     }
 
+    /// A no-op when the repository is no longer listed.
+    func setOverrides(_ overrides: RepositoryOverrides, forRepository id: RepositoryConfiguration.ID) {
+        guard let index = configuration.repositories.firstIndex(where: { $0.id == id }) else { return }
+        configuration.repositories[index].overrides = overrides.normalized
+    }
+
     private func save() {
         try? paths.prepare()
         guard let data = try? encoder.encode(configuration) else { return }
