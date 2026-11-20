@@ -1087,6 +1087,219 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(events.last?.kind, .approved)
     }
 
+    func testARepositoryPolicyOverrideDecidesInsteadOfTheGlobalPolicy() async throws {
+        let fixture = try FeatureFixture(repository: widget(overrides: RepositoryOverrides(
+            decisionPolicy: DecisionPolicy(shouldFix: .requestChanges, nitsOnly: .requestChanges, clean: .approve)
+        )))
+        let runner = ReviewWorkflowMock(claudeVerdict: .nitsOnly)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(postArgument, "--request-changes")
+        XCTAssertEqual(events.last?.kind, .changesRequested)
+        XCTAssertTrue(postedBody.contains("this repository's decision policy treats as blocking"))
+        XCTAssertTrue(events.last?.message.contains("Repository decision policy.") ?? false)
+    }
+
+    func testARepositoryPolicyOverrideCanBeLooserThanTheGlobalPolicy() async throws {
+        let fixture = try FeatureFixture(repository: widget(overrides: RepositoryOverrides(
+            decisionPolicy: DecisionPolicy(shouldFix: .approve, nitsOnly: .approve, clean: .approve)
+        )))
+        let runner = ReviewWorkflowMock(claudeVerdict: .shouldFix)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(postArgument, "--approve")
+        XCTAssertEqual(events.last?.kind, .approved)
+    }
+
+    func testARepositoryWithoutOverridesFollowsTheGlobalPolicyExactlyAsBefore() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeVerdict: .nitsOnly)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.decisionPolicy = DecisionPolicy(
+            shouldFix: .requestChanges,
+            nitsOnly: .requestChanges,
+            clean: .approve
+        )
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let postedBody = await runner.lastPostedBody()
+        XCTAssertEqual(postArgument, "--request-changes")
+        XCTAssertTrue(postedBody.contains("the current decision policy treats as blocking"))
+        XCTAssertFalse(postedBody.contains("this repository's decision policy"))
+        XCTAssertFalse(events.contains { $0.message.contains("Repository decision policy") })
+    }
+
+    func testARepositoryPolicyDecidesWhetherReviewersDisagree() async throws {
+        // Under the default policy these verdicts straddle the gate and would reconcile; under
+        // the repository's approve-everything policy they do not.
+        let fixture = try FeatureFixture(repository: widget(overrides: RepositoryOverrides(
+            decisionPolicy: DecisionPolicy(shouldFix: .approve, nitsOnly: .approve, clean: .approve)
+        )))
+        let runner = ReviewWorkflowMock(claudeVerdict: .clean, codexVerdict: .shouldFix)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let reconciliationCount = await runner.reconciliationCount()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(reconciliationCount, 0)
+        XCTAssertEqual(postArgument, "--approve")
+    }
+
+    func testAReconciledVerdictIsMappedThroughTheRepositoryPolicy() async throws {
+        let fixture = try FeatureFixture(repository: widget(overrides: RepositoryOverrides(
+            decisionPolicy: .default
+        )))
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .shouldFix,
+            reconciledVerdict: .shouldFix
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+        configuration.decisionPolicy = DecisionPolicy(shouldFix: .approve, nitsOnly: .approve, clean: .approve)
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let reconciliationCount = await runner.reconciliationCount()
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(reconciliationCount, 1)
+        XCTAssertEqual(postArgument, "--request-changes")
+    }
+
+    func testARepositoryPolicyNeverApprovesAPartialPanel() async throws {
+        let fixture = try FeatureFixture(repository: widget(overrides: RepositoryOverrides(
+            decisionPolicy: DecisionPolicy(shouldFix: .requestChanges, nitsOnly: .approve, clean: .approve)
+        )))
+        let runner = ReviewWorkflowMock(claudeVerdict: .clean, failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let body = await runner.lastPostedBody()
+        XCTAssertEqual(postArgument, "--comment")
+        XCTAssertEqual(events.last?.kind, .commented)
+        XCTAssertFalse(events.contains { $0.kind == .approved })
+        XCTAssertTrue(body.contains("This repository's decision policy would approve this"))
+        XCTAssertTrue(body.contains("a partial panel never approves"))
+    }
+
+    func testARepositoryPromptReachesTheReviewerAfterTheGlobalPromptAndBeforeReviewMd() async throws {
+        let fixture = try FeatureFixture(repository: widget(overrides: RepositoryOverrides(
+            prompt: "Billing code needs integration tests.",
+            promptMode: .append
+        )))
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let prompt = await runner.lastClaudePrompt()
+        let facts = try XCTUnwrap(prompt.range(of: "## Pull request facts"))
+        let global = try XCTUnwrap(prompt.range(of: "Check public API compatibility."))
+        let heading = try XCTUnwrap(prompt.range(of: "## Developer-specific review instructions for this repository"))
+        let local = try XCTUnwrap(prompt.range(of: "Billing code needs integration tests."))
+        let rules = try XCTUnwrap(prompt.range(of: "## Mandatory repository review rules"))
+        XCTAssertTrue(facts.lowerBound < global.lowerBound)
+        XCTAssertTrue(global.lowerBound < heading.lowerBound)
+        XCTAssertTrue(heading.lowerBound < local.lowerBound)
+        XCTAssertTrue(local.lowerBound < rules.lowerBound)
+        XCTAssertTrue(prompt.hasSuffix("--- END REVIEW.md ---"))
+    }
+
+    func testAReplacingRepositoryPromptIsSentInsteadOfTheGlobalPrompt() async throws {
+        let fixture = try FeatureFixture(repository: widget(overrides: RepositoryOverrides(
+            prompt: "Billing code needs integration tests.",
+            promptMode: .replace
+        )))
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let prompt = await runner.lastClaudePrompt()
+        XCTAssertTrue(prompt.contains(
+            "## Developer-specific review instructions\nBilling code needs integration tests."
+        ))
+        XCTAssertFalse(prompt.contains("Check public API compatibility."))
+        XCTAssertFalse(prompt.contains("## Developer-specific review instructions for this repository"))
+        XCTAssertTrue(prompt.contains("Never approve an untested migration."))
+    }
+
+    func testARepositoryWithoutOverridesGetsThePromptItAlwaysDid() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let prompt = await runner.lastClaudePrompt()
+        XCTAssertTrue(prompt.contains(
+            "## Developer-specific review instructions\nCheck public API compatibility."
+        ))
+        XCTAssertFalse(prompt.contains("## Developer-specific review instructions for this repository"))
+    }
+
     func testIncrementalScopeDiffsAgainstLastReviewedHead() async throws {
         let fixture = try FeatureFixture()
         // A prior review recorded an earlier head; the mock's current head is 1234567890abcdef.
@@ -2569,6 +2782,10 @@ private final class TestClock: @unchecked Sendable {
         defer { lock.unlock() }
         date = date.addingTimeInterval(TimeInterval(minutes) * 60)
     }
+}
+
+private func widget(overrides: RepositoryOverrides) -> RepositoryConfiguration {
+    RepositoryConfiguration(name: "widget", path: "/mock/widget", githubSlug: "acme/widget", overrides: overrides)
 }
 
 private struct FeatureFixture {

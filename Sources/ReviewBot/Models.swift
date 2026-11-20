@@ -165,6 +165,82 @@ struct ReviewerConfiguration: Codable, Equatable {
     }
 }
 
+/// How a repository's own review instructions combine with the global custom prompt.
+enum RepositoryPromptMode: String, Codable, CaseIterable, Identifiable {
+    /// Sent after the global instructions, in addition to them.
+    case append
+    /// Sent instead of the global instructions.
+    case replace
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .append: "Add to the global instructions"
+        case .replace: "Replace the global instructions"
+        }
+    }
+}
+
+/// What one repository does differently from the global settings. Every field has an
+/// "inherit" value, and `ReviewBotConfiguration.effectiveSettings(for:)` is the only place
+/// the two are combined.
+struct RepositoryOverrides: Codable, Equatable {
+    /// `nil` follows the global decision policy.
+    var decisionPolicy: DecisionPolicy?
+    /// Blank follows the global custom prompt whatever `promptMode` says: a blank prompt
+    /// never removes the global one.
+    var prompt: String
+    var promptMode: RepositoryPromptMode
+
+    static let empty = RepositoryOverrides()
+
+    init(
+        decisionPolicy: DecisionPolicy? = nil,
+        prompt: String = "",
+        promptMode: RepositoryPromptMode = .append
+    ) {
+        self.decisionPolicy = decisionPolicy
+        self.prompt = prompt
+        self.promptMode = promptMode
+    }
+
+    var hasPrompt: Bool {
+        !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var isEmpty: Bool { decisionPolicy == nil && !hasPrompt }
+
+    /// The stored form: a blank prompt carries no mode, so "no overrides" is always `.empty`.
+    var normalized: RepositoryOverrides {
+        hasPrompt ? self : RepositoryOverrides(decisionPolicy: decisionPolicy)
+    }
+
+    /// One line for the repository list, or `nil` when the repository follows the global settings.
+    var summary: String? {
+        var parts: [String] = []
+        if decisionPolicy != nil { parts.append("Own decision policy") }
+        if hasPrompt {
+            parts.append(promptMode == .replace ? "Replaces the global instructions" : "Adds review instructions")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case decisionPolicy, prompt, promptMode
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        // `try?` throughout: a value this build cannot read follows the global setting
+        // instead of throwing the whole file away, as `managedClone` does.
+        decisionPolicy = (try? values.decodeIfPresent(DecisionPolicy.self, forKey: .decisionPolicy)) ?? nil
+        prompt = ((try? values.decodeIfPresent(String.self, forKey: .prompt)) ?? nil) ?? ""
+        promptMode = ((try? values.decodeIfPresent(String.self, forKey: .promptMode)) ?? nil)
+            .flatMap(RepositoryPromptMode.init(rawValue:)) ?? .append
+    }
+}
+
 struct RepositoryConfiguration: Codable, Equatable, Identifiable {
     var id: UUID
     var name: String
@@ -175,6 +251,7 @@ struct RepositoryConfiguration: Codable, Equatable, Identifiable {
     /// under `StoragePaths.repositoriesDirectory`, and derives its location and URL from
     /// `githubSlug`. `path` is then informational only.
     var managedClone: CloneTransport?
+    var overrides: RepositoryOverrides
 
     var isManaged: Bool { managedClone != nil }
 
@@ -184,7 +261,8 @@ struct RepositoryConfiguration: Codable, Equatable, Identifiable {
         path: String,
         githubSlug: String,
         enabled: Bool = true,
-        managedClone: CloneTransport? = nil
+        managedClone: CloneTransport? = nil,
+        overrides: RepositoryOverrides = .empty
     ) {
         self.id = id
         self.name = name
@@ -192,10 +270,11 @@ struct RepositoryConfiguration: Codable, Equatable, Identifiable {
         self.githubSlug = githubSlug
         self.enabled = enabled
         self.managedClone = managedClone
+        self.overrides = overrides
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, path, githubSlug, enabled, managedClone
+        case id, name, path, githubSlug, enabled, managedClone, overrides
     }
 
     init(from decoder: Decoder) throws {
@@ -210,6 +289,7 @@ struct RepositoryConfiguration: Codable, Equatable, Identifiable {
         // instead of throwing the whole file away.
         managedClone = ((try? values.decodeIfPresent(String.self, forKey: .managedClone)) ?? nil)
             .flatMap(CloneTransport.init(rawValue:))
+        overrides = ((try? values.decodeIfPresent(RepositoryOverrides.self, forKey: .overrides)) ?? nil) ?? .empty
     }
 }
 
@@ -594,7 +674,45 @@ enum ReviewerName: String, Codable, CaseIterable {
     }
 }
 
+/// What one repository's reviews run under: the global settings with its overrides applied.
+struct EffectiveReviewSettings: Equatable {
+    let decisionPolicy: DecisionPolicy
+    /// Whether `decisionPolicy` is the repository's own. The posted review and history say so.
+    let usesRepositoryDecisionPolicy: Bool
+    /// Rendered under "Developer-specific review instructions".
+    let developerPrompt: String
+    /// Rendered after it under its own heading. Non-empty only when a repository adds to a
+    /// global prompt that exists.
+    let repositoryPrompt: String
+}
+
 extension ReviewBotConfiguration {
+    /// The only place a repository's overrides meet the global settings. `ReviewEngine` must
+    /// read the policy and prompt from here, never from `decisionPolicy`/`customPrompt` directly.
+    func effectiveSettings(for repository: RepositoryConfiguration) -> EffectiveReviewSettings {
+        let overrides = repository.overrides
+        let global = customPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let local = overrides.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let developerPrompt: String
+        let repositoryPrompt: String
+        if local.isEmpty {
+            developerPrompt = global
+            repositoryPrompt = ""
+        } else if overrides.promptMode == .replace || global.isEmpty {
+            developerPrompt = local
+            repositoryPrompt = ""
+        } else {
+            developerPrompt = global
+            repositoryPrompt = local
+        }
+        return EffectiveReviewSettings(
+            decisionPolicy: overrides.decisionPolicy ?? decisionPolicy,
+            usesRepositoryDecisionPolicy: overrides.decisionPolicy != nil,
+            developerPrompt: developerPrompt,
+            repositoryPrompt: repositoryPrompt
+        )
+    }
+
     /// The stored settings for one reviewer. A total switch, so credential code can ask about a
     /// reviewer it was handed rather than every caller repeating the mapping.
     func settings(for reviewer: ReviewerName) -> ReviewerConfiguration {

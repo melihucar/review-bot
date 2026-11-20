@@ -510,6 +510,33 @@ final class ConfigurationAndPromptTests: XCTestCase {
         XCTAssertTrue(developerRange.lowerBound < rulesRange.lowerBound)
     }
 
+    func testRepositoryCustomizationSitsBetweenTheGlobalPromptAndReviewMd() throws {
+        let prompt = DefaultPrompt.combined(
+            with: "Custom",
+            repositoryCustomization: "Local",
+            repositoryRules: "Rule",
+            pullRequestFacts: "## Pull request facts\n\nX"
+        )
+
+        let facts = try XCTUnwrap(prompt.range(of: "## Pull request facts"))
+        let global = try XCTUnwrap(prompt.range(of: "## Developer-specific review instructions\nCustom"))
+        let heading = try XCTUnwrap(prompt.range(of: "## Developer-specific review instructions for this repository"))
+        let local = try XCTUnwrap(prompt.range(of: "Local"))
+        let rules = try XCTUnwrap(prompt.range(of: "## Mandatory repository review rules"))
+        XCTAssertTrue(facts.lowerBound < global.lowerBound)
+        XCTAssertTrue(global.lowerBound < heading.lowerBound)
+        XCTAssertTrue(heading.lowerBound < local.lowerBound)
+        XCTAssertTrue(local.lowerBound < rules.lowerBound)
+        XCTAssertTrue(prompt.hasSuffix("--- END REVIEW.md ---"))
+    }
+
+    func testABlankRepositoryCustomizationLeavesThePromptUnchanged() {
+        XCTAssertEqual(
+            DefaultPrompt.combined(with: "Custom", repositoryCustomization: " \n", repositoryRules: "Rule"),
+            DefaultPrompt.combined(with: "Custom", repositoryRules: "Rule")
+        )
+    }
+
     /// Without facts the prompt must be exactly what it was before facts existed: the contract,
     /// then the developer's instructions, with nothing inserted between them.
     func testCombinedWithoutFactsIsUnchanged() {

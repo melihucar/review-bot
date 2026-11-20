@@ -41,6 +41,7 @@ private struct GeneralSettingsView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var settings: SettingsStore
     @State private var repositoryAddress = ""
+    @State private var customizing: RepositoryConfiguration?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -190,6 +191,7 @@ private struct GeneralSettingsView: View {
                     ForEach($settings.configuration.repositories) { $repository in
                         RepositoryRow(
                             repository: $repository,
+                            onCustomize: { customizing = repository },
                             onDelete: { Task { await model.removeRepository(repository.id) } }
                         )
                     }
@@ -204,6 +206,15 @@ private struct GeneralSettingsView: View {
             }
         }
         .padding(.top, 8)
+        .sheet(item: $customizing) { repository in
+            RepositoryCustomizationSheet(
+                repository: repository,
+                globalPolicy: settings.configuration.decisionPolicy,
+                hasGlobalPrompt: !settings.configuration.customPrompt
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                onSave: { settings.setOverrides($0, forRepository: repository.id) }
+            )
+        }
     }
 
     private var isAdding: Bool { model.repositoryAdditionProgress != nil }
@@ -232,6 +243,7 @@ private struct GeneralSettingsView: View {
 
 private struct RepositoryRow: View {
     @Binding var repository: RepositoryConfiguration
+    let onCustomize: () -> Void
     let onDelete: () -> Void
     @State private var confirmDelete = false
 
@@ -283,9 +295,26 @@ private struct RepositoryRow: View {
                             .textSelection(.enabled)
                     }
                 }
+                if let summary = repository.overrides.summary {
+                    HStack {
+                        Text("Custom")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 48, alignment: .leading)
+                        Label(summary, systemImage: "slider.horizontal.3")
+                            .font(.caption)
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .help("This repository does not fully follow the global settings. Choose Customize… to change or reset them.")
+                }
             }
 
             Spacer(minLength: 8)
+
+            Button("Customize…", action: onCustomize)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Give this repository its own decision policy or review instructions")
 
             Button(role: .destructive) {
                 confirmDelete = true
@@ -310,6 +339,145 @@ private struct RepositoryRow: View {
                     ? "Review Bot stops watching this repository and deletes the clone it keeps in its own data folder. Nothing else on your Mac is affected."
                     : "Review Bot stops watching this repository. Your local files are not affected."
             )
+        }
+    }
+}
+
+private struct RepositoryCustomizationSheet: View {
+    let repository: RepositoryConfiguration
+    let globalPolicy: DecisionPolicy
+    let hasGlobalPrompt: Bool
+    let onSave: (RepositoryOverrides) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: RepositoryOverrides
+    /// The last policy the toggle held, so switching it off and on again restores it.
+    @State private var rememberedPolicy: DecisionPolicy?
+
+    init(
+        repository: RepositoryConfiguration,
+        globalPolicy: DecisionPolicy,
+        hasGlobalPrompt: Bool,
+        onSave: @escaping (RepositoryOverrides) -> Void
+    ) {
+        self.repository = repository
+        self.globalPolicy = globalPolicy
+        self.hasGlobalPrompt = hasGlobalPrompt
+        self.onSave = onSave
+        _draft = State(initialValue: repository.overrides)
+        _rememberedPolicy = State(initialValue: repository.overrides.decisionPolicy)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Customize \(repository.name)")
+                    .font(.title2.weight(.semibold))
+                Text("These settings apply only to reviews of \(repository.githubSlug). Anything you leave alone follows the global setting.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 12) {
+                    Toggle("Use a different decision policy for this repository", isOn: usesOwnPolicy)
+                    DecisionPolicyRows(policy: policy, showsBlocking: false)
+                        .disabled(draft.decisionPolicy == nil)
+                    Text(
+                        draft.decisionPolicy == nil
+                            ? "Showing the global policy, which this repository follows. Blocking always requests changes."
+                            : "Blocking always requests changes. A partial panel still never approves."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(8)
+            } label: {
+                Label("Decision policy", systemImage: "checklist")
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("How these combine with the global instructions", selection: $draft.promptMode) {
+                        ForEach(RepositoryPromptMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+
+                    TextEditor(text: $draft.prompt)
+                        .font(.body.monospaced())
+                        .frame(minHeight: 96)
+                        .padding(6)
+                        .background(.quaternary.opacity(0.35))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(.separator, lineWidth: 1)
+                        }
+
+                    Text(promptExplanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(8)
+            } label: {
+                Label("Review instructions", systemImage: "text.quote")
+            }
+
+            HStack {
+                Button("Reset to global") { draft = .empty }
+                    .disabled(draft == .empty)
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    onSave(draft)
+                    dismiss()
+                }
+                .keyboardShortcut(.return, modifiers: .command)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 600)
+    }
+
+    private var usesOwnPolicy: Binding<Bool> {
+        Binding(
+            get: { draft.decisionPolicy != nil },
+            set: { isOn in
+                if isOn {
+                    draft.decisionPolicy = rememberedPolicy ?? globalPolicy
+                } else {
+                    rememberedPolicy = draft.decisionPolicy ?? rememberedPolicy
+                    draft.decisionPolicy = nil
+                }
+            }
+        )
+    }
+
+    /// The draft's policy, or the global one shown read-only while the toggle is off.
+    private var policy: Binding<DecisionPolicy> {
+        Binding(
+            get: { draft.decisionPolicy ?? globalPolicy },
+            set: { draft.decisionPolicy = $0 }
+        )
+    }
+
+    private var promptExplanation: String {
+        guard draft.hasPrompt else {
+            return "Empty: this repository gets the global instructions only."
+        }
+        switch draft.promptMode {
+        case .append:
+            return hasGlobalPrompt
+                ? "Sent after the global instructions and before the repository's REVIEW.md."
+                : "There are no global instructions, so these are sent on their own, before the repository's REVIEW.md."
+        case .replace:
+            return "Sent instead of the global instructions for this repository. REVIEW.md still applies."
         }
     }
 }
@@ -718,37 +886,12 @@ private struct DecisionPolicySettingsView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Decision policy")
                     .font(.title2.weight(.semibold))
-                Text("Choose what Review Bot does on GitHub for each severity its reviewers report. When reviewers disagree across the request-changes line, Review Bot reconciles before deciding.")
+                Text("Choose what Review Bot does on GitHub for each severity its reviewers report. When reviewers disagree across the request-changes line, Review Bot reconciles before deciding. A repository can use its own policy from Repositories → Customize….")
                     .foregroundStyle(.secondary)
             }
 
             GroupBox {
-                VStack(alignment: .leading, spacing: 14) {
-                    DecisionRow(
-                        verdict: "Blocking",
-                        detail: "Always requests changes.",
-                        selection: .constant(.requestChanges)
-                    )
-                    .disabled(true)
-
-                    Divider()
-
-                    DecisionRow(
-                        verdict: "Should-fix",
-                        detail: "Substantive issues that are not release-blocking.",
-                        selection: $settings.configuration.decisionPolicy.shouldFix
-                    )
-                    DecisionRow(
-                        verdict: "Nits only",
-                        detail: "Minor, optional suggestions.",
-                        selection: $settings.configuration.decisionPolicy.nitsOnly
-                    )
-                    DecisionRow(
-                        verdict: "Clean",
-                        detail: "No issues found.",
-                        selection: $settings.configuration.decisionPolicy.clean
-                    )
-                }
+                DecisionPolicyRows(policy: $settings.configuration.decisionPolicy)
                 .padding(8)
             } label: {
                 Label("When the strictest verdict is…", systemImage: "arrow.triangle.branch")
@@ -770,6 +913,33 @@ private struct DecisionPolicySettingsView: View {
             Spacer()
         }
         .padding(.top, 10)
+    }
+}
+
+private struct DecisionPolicyRows: View {
+    @Binding var policy: DecisionPolicy
+    var showsBlocking = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if showsBlocking {
+                DecisionRow(
+                    verdict: "Blocking",
+                    detail: "Always requests changes.",
+                    selection: .constant(.requestChanges)
+                )
+                .disabled(true)
+
+                Divider()
+            }
+            DecisionRow(
+                verdict: "Should-fix",
+                detail: "Substantive issues that are not release-blocking.",
+                selection: $policy.shouldFix
+            )
+            DecisionRow(verdict: "Nits only", detail: "Minor, optional suggestions.", selection: $policy.nitsOnly)
+            DecisionRow(verdict: "Clean", detail: "No issues found.", selection: $policy.clean)
+        }
     }
 }
 
@@ -808,7 +978,7 @@ private struct PromptSettingsView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Custom review instructions")
                     .font(.title2.weight(.semibold))
-                Text("These instructions are appended to Review Bot's built-in review and verdict contract for every repository.")
+                Text("These instructions are appended to Review Bot's built-in review and verdict contract for every repository. A repository can add to or replace them from Repositories → Customize….")
                     .foregroundStyle(.secondary)
             }
 
